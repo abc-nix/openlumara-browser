@@ -1,0 +1,39 @@
+{# screenshot tool card: the tool result only carries the file name and the
+   geometry; the picture is fetched from the module route and rendered small
+   (css), so right-click -> open image in new tab shows the full-resolution
+   capture. rendered through the core tool_display extension slot, which
+   mirrors this template's path and calls the `tool_views` macro. #}
+{% macro tool_views() %}
+<template x-if="toolDisplayView(tool) === 'browser-shot'">
+    <div class="browser-shot"
+         x-data="{ src: '', loaded: '', err: '',
+                   load() {
+                       const f = toolResponse(tool)?.content?.file;
+                       if (!f || f === this.loaded) return;
+                       this.loaded = f;
+                       this.err = '';
+                       fetch('/api/ext/browser/shot?file=' + encodeURIComponent(f))
+                           .then(r => r.json())
+                           .then(j => {
+                               // the route answers success:false when the file was
+                               // pruned (data/screenshots is not permanent)
+                               if (!j.success) throw new Error(String(j.data ?? 'could not load the screenshot'));
+                               this.src = 'data:' + j.data.mime + ';base64,' + j.data.data;
+                           })
+                           .catch(e => {
+                               this.err = (e && e.message) || 'could not load the screenshot';
+                               this.loaded = '';   // allow a retry on the next effect run
+                           });
+                   } }"
+         x-effect="load()">
+        <template x-if="src">
+            <img class="browser-shot-thumb" :src="src" loading="lazy" alt="screenshot">
+        </template>
+        <div class="browser-shot-path" x-show="toolResponse(tool)?.content?.path"
+             x-text="toolResponse(tool)?.content?.path"></div>
+        {# tool errors are rendered by the core card (toolDisplayError), so this
+           row is only for the image fetch itself #}
+        <div class="display-error" x-show="err" x-text="err"></div>
+    </div>
+</template>
+{% endmacro %}
