@@ -139,8 +139,8 @@ class Browser(CdpEvents, RestartState, WebuiRoutes,
         },
         "auto_accept_dialogs": {
             "type": "boolean",
-            "description": "Automatically accept JavaScript dialogs (alert, confirm, prompt) so they never block the page. Turn off to decide with the handle_dialog tool instead. Note that accepting a confirm dialog can trigger irreversible actions on some sites.",
-            "default": True,
+            "description": "Automatically accept JavaScript dialogs (alert, confirm, prompt) so they never block the page. Off by default: dialogs wait for the handle_dialog tool instead. Note that accepting a confirm dialog can trigger irreversible actions on some sites.",
+            "default": False,
         },
         "enable_network_monitoring": {
             "type": "boolean",

@@ -141,7 +141,7 @@ class CdpEvents:
                 "sessionId": sid,
                 "targetId": self._target_of_session(sid),
             }
-            if self.config.get("auto_accept_dialogs", True):
+            if self.config.get("auto_accept_dialogs", False):
                 asyncio.create_task(self._auto_accept_dialog(sid))
         elif method == "Page.javascriptDialogClosed":
             # authoritative signal from Chrome that a dialog was resolved
