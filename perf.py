@@ -241,6 +241,7 @@ class PerfMonitor:
         self._perf_interval = max(int(self.config.get("perf_interval_ms", 1000) or 1000), 250) / 1000.0
         self._perf_recording = False
         self._perf_session_start = 0
+        self._perf_session_elapsed = 0.0
         self._perf_event_log = deque(maxlen=max(int(self.config.get("perf_events_max", 5000) or 5000), 100))
         self._perf_event_seq = 0
         self._perf_profile = []
@@ -263,6 +264,7 @@ class PerfMonitor:
     def perf_reset(self):
         self._perf_selected_target = None
         self._perf_recording = False
+        self._perf_session_elapsed = 0.0
         self._perf_profile = []
         self._perf_profile_active = False
         self._perf_profile_sid = None
@@ -569,7 +571,9 @@ class PerfMonitor:
 
     def _perf_session_seconds(self):
         if self._perf_session_start <= 0:
-            return 0
+            return round(max(self._perf_session_elapsed, 0), 1)
+        if not self._perf_recording:
+            return round(max(self._perf_session_elapsed, 0), 1)
         return max(0, round((time.time() * 1000 - self._perf_session_start) / 1000, 1))
 
     async def _perf_summary(self, target_id=None, limit=180):
@@ -605,11 +609,16 @@ class PerfMonitor:
             self._perf_event_log.clear()
             self._perf_event_seq = 0
             self._perf_profile = []
+            self._perf_session_elapsed = 0.0
             self._perf_session_start = time.time() * 1000
             self._perf_recording = True
             await self._perf_agent_start()
             await self._perf_profile_start()
         else:
+            if self._perf_session_start > 0:
+                self._perf_session_elapsed = max(
+                    0.0, (time.time() * 1000 - self._perf_session_start) / 1000)
+            await self._perf_drain_events()
             self._perf_recording = False
             await self._perf_profile_stop()
             try:
@@ -644,6 +653,7 @@ class PerfMonitor:
         self._perf_event_log.clear()
         self._perf_profile = []
         self._perf_session_start = 0
+        self._perf_session_elapsed = 0.0
         self._perf_recording = False
         return {"recording": False, "event_count": 0, "session_seconds": 0}
 
