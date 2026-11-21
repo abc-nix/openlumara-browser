@@ -1,0 +1,6 @@
+__pycache__/
+tests/
+*.bak
+*~
+*.log
+browser/REVIEW.md
