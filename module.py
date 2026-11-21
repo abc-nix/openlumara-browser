@@ -576,6 +576,12 @@ class Browser(CdpEvents, RestartState, WebuiRoutes, WebuiPerfRoutes,
             await self._cdp.cmd("Performance.enable", {}, sid)
         except Exception:
             pass
+        # Install the page agent before the page's own scripts: document-start
+        # registration means handlers registered during load are captured too.
+        try:
+            await self._perf_install_doc_agent(target_id, sid)
+        except Exception:
+            pass
         if self.config.get("enable_network_monitoring", False):
             await self._cdp.cmd("Network.enable", {}, sid)
 

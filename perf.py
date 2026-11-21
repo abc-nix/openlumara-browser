@@ -95,6 +95,13 @@ AGENT_JS = r"""
       }
       let w = wrapped.get(listener);
       if (!w) {
+        // Captured once, at registration: the invocation stack says who fired
+        // the handler, this says which code registered it - the only thing
+        // that identifies an anonymous listener.
+        let site = null;
+        try {
+          site = String(new Error().stack).split('\n').slice(2, 5).map((s) => s.trim()).filter(Boolean);
+        } catch (e) {}
         w = function(ev) {
           if (!M.enabled) return listener.call(this, ev);
           const t0 = performance.now();
@@ -108,7 +115,7 @@ AGENT_JS = r"""
             }
             M.push({kind: 'input', name: type, duration: dur, target: describe(this),
                     handler: {name: listener.name || 'anonymous',
-                              source: String(listener).slice(0, 300), stack: stack},
+                              source: String(listener).slice(0, 300), stack: stack, site: site},
                     data: {}, during_scroll: performance.now() - M.scrollAt < 200});
           }
         };
@@ -147,6 +154,42 @@ AGENT_JS = r"""
 """
 
 AGENT_START_JS = "window.__olMonitor && window.__olMonitor.start(); 'ok'"
+
+# The agent installed at document start is identical except that it idles until
+# a recording session arms it: resource sampling is always on, so a page that is
+# only being sampled must not accumulate events in memory. Installing at
+# document start is the point of it - the addEventListener/rAF wrappers must
+# exist before the page's own scripts register their handlers, otherwise
+# listeners from the first page load never appear in top_handlers.
+AGENT_DOC_JS = AGENT_JS.replace("enabled: true, installed: false",
+                                "enabled: false, installed: false")
+if AGENT_DOC_JS == AGENT_JS:
+    # The variants are derived from one source. If that literal is ever
+    # reformatted, the document-start copy silently turns into the always-on
+    # agent (every page would queue events while merely being sampled), so
+    # fail here instead of degrading quietly.
+    raise RuntimeError(
+        "perf.py: the 'enabled: true, installed: false' literal in AGENT_JS is "
+        "gone, so AGENT_DOC_JS is not the idle variant")
+
+
+def _agent_arm_js(elapsed_ms):
+    """Arm the idle document-start agent, keeping the session clock continuous.
+
+    A document created mid-recording (a navigation) starts its `sessionStart` at
+    its own load time, so its events would report `rel_ms` near 0 and be placed
+    at the beginning of the timeline. Shifting `sessionStart` by the difference
+    pins them where the session actually is. An agent that is already armed is
+    left alone, so repeated calls during one recording do not drift the clock.
+    """
+    return (
+        "(() => { const M = window.__olMonitor;"
+        " if (!M) return 'missing';"
+        " if (M.enabled) return 'armed';"
+        f" M.sessionStart -= Math.max(0, {int(elapsed_ms)} - (performance.now() - M.sessionStart));"
+        " M.enabled = true; return 'armed'; })()"
+    )
+
 
 PROBE_JS = r"""
 (() => {
@@ -245,8 +288,10 @@ class PerfMonitor:
         self._perf_event_log = deque(maxlen=max(int(self.config.get("perf_events_max", 5000) or 5000), 100))
         self._perf_event_seq = 0
         self._perf_profile = []
+        self._perf_profile_meta = {}
         self._perf_profile_active = False
         self._perf_profile_sid = None
+        self._perf_doc_agents = {}
         self._perf_stop = asyncio.Event()
         self._perf_task = asyncio.create_task(self._perf_loop())
 
@@ -266,8 +311,10 @@ class PerfMonitor:
         self._perf_recording = False
         self._perf_session_elapsed = 0.0
         self._perf_profile = []
+        self._perf_profile_meta = {}
         self._perf_profile_active = False
         self._perf_profile_sid = None
+        self._perf_doc_agents = {}
         for name in ("_perf_samples", "_perf_last_metrics", "_perf_event_log"):
             bucket = getattr(self, name, None)
             if bucket is not None and hasattr(bucket, "clear"):
@@ -348,6 +395,27 @@ class PerfMonitor:
         except Exception:
             pass
 
+    async def _perf_install_doc_agent(self, target_id, session_id):
+        """Register AGENT_DOC_JS to run at document start for one tab.
+
+        Called from _attach_target, so it covers every tab the module attaches,
+        not just the monitor's selection. Registration is per CDP session
+        (session ids die with the connection), hence the id comparison to keep
+        it idempotent. Tabs that were already attached before this ran keep the
+        Runtime.evaluate path, which installs the agent in the live document.
+        """
+        if not target_id or not session_id:
+            return
+        installed = getattr(self, "_perf_doc_agents", None)
+        if not isinstance(installed, dict):
+            installed = self._perf_doc_agents = {}
+        if installed.get(target_id) == session_id:
+            return
+        await self._cdp.cmd("Page.addScriptToEvaluateOnNewDocument",
+                            {"source": AGENT_DOC_JS},
+                            session_id, timeout=2.0)
+        installed[target_id] = session_id
+
     async def _perf_profile_start(self):
         target = self._perf_selected_target
         if not target or not self._is_connected():
@@ -384,6 +452,7 @@ class PerfMonitor:
             self._perf_profile = self._perf_profile_parse(profile)
         except Exception:
             self._perf_profile = []
+            self._perf_profile_meta = {}
 
     def _perf_profile_parse(self, profile):
         nodes = {n["id"]: n for n in (profile.get("nodes") or [])
@@ -412,10 +481,18 @@ class PerfMonitor:
                 total[cur] = total.get(cur, 0.0) + value
 
         groups = {}
+        # V8 names the two frames that are not code under test: `(idle)` is the
+        # renderer waiting for work, `(program)` its own runtime. They dominate
+        # by construction, so they are not functions to attribute - counted
+        # here and reported separately as overhead instead of as rows.
+        noise_ms = {"(idle)": 0.0, "(program)": 0.0}
         for node_id, node in nodes.items():
             frame = node.get("callFrame") or {}
             name = frame.get("functionName") or "(anonymous)"
             if name == "(root)":
+                continue
+            if name in noise_ms:
+                noise_ms[name] += self_ms.get(node_id, 0.0)
                 continue
             url = frame.get("url") or ""
             line = int(frame.get("lineNumber") or 0) + 1
@@ -443,6 +520,12 @@ class PerfMonitor:
             row["self_ms"] = round(row["self_ms"], 1)
             row["total_ms"] = round(row["total_ms"], 1)
             result.append(row)
+        self._perf_profile_meta = {
+            "idle_ms": round(noise_ms["(idle)"], 1),
+            "program_ms": round(noise_ms["(program)"], 1),
+            "functions": len(rows),
+            "returned": len(result),
+        }
         return result
 
     async def _perf_drain_events(self):
@@ -459,6 +542,15 @@ class PerfMonitor:
             return
         try:
             await self._cdp.cmd("Runtime.evaluate", {"expression": AGENT_JS, "returnByValue": True}, sid, timeout=2.0)
+            if self._perf_recording:
+                # A document created mid-recording (navigation) starts with the
+                # idle document-start agent: arm it without dropping what it has
+                # already queued, and keep its clock on the session's timeline.
+                await self._cdp.cmd(
+                    "Runtime.evaluate",
+                    {"expression": _agent_arm_js(self._perf_session_seconds() * 1000),
+                     "returnByValue": True},
+                    sid, timeout=2.0)
             res = await self._cdp.cmd(
                 "Runtime.evaluate",
                 {"expression": "window.__olMonitor ? JSON.stringify(window.__olMonitor.drain()) : '[]'",
@@ -609,6 +701,7 @@ class PerfMonitor:
             self._perf_event_log.clear()
             self._perf_event_seq = 0
             self._perf_profile = []
+            self._perf_profile_meta = {}
             self._perf_session_elapsed = 0.0
             self._perf_session_start = time.time() * 1000
             self._perf_recording = True
@@ -652,6 +745,7 @@ class PerfMonitor:
     async def _perf_clear_events(self):
         self._perf_event_log.clear()
         self._perf_profile = []
+        self._perf_profile_meta = {}
         self._perf_session_start = 0
         self._perf_session_elapsed = 0.0
         self._perf_recording = False
@@ -667,7 +761,15 @@ class PerfMonitor:
             name = handler.get("name") if isinstance(handler, dict) else None
             if not name or name == "—":
                 continue
-            row = by_name.setdefault(name, {"name": name, "calls": 0, "ms": 0.0})
+            label = name
+            if name == "anonymous":
+                # Unnamed listeners are only distinguishable by where they were
+                # registered, so group them by that site instead of one row.
+                site = handler.get("site") if isinstance(handler, dict) else None
+                if site:
+                    frame = str(site[0] if isinstance(site, list) else site)[:90]
+                    label = f"anonymous @ {frame}"
+            row = by_name.setdefault(label, {"name": label, "calls": 0, "ms": 0.0})
             row["calls"] += 1
             row["ms"] += _number(e.get("duration"))
         rows = sorted(by_name.values(), key=lambda r: (r["ms"], r["calls"]), reverse=True)
@@ -707,6 +809,7 @@ class PerfMonitor:
             "top_handlers": self._perf_top_handlers(events),
             "profile_active": self._perf_profile_active,
             "top_functions": self._perf_profile[:10],
+            "profile_noise": self._perf_profile_meta,
             "resource_latest": latest,
             "resource_samples": len(samples),
         }, success=True)
@@ -773,6 +876,8 @@ class PerfMonitor:
 
         The profile is collected while recording and parsed when recording is
         paused. If the list is empty, record, interact, then pause first.
+        `(idle)` and `(program)` frames are excluded from the rows and reported
+        as `profile_noise` instead.
 
         Args:
             min_total_ms: only functions with at least this total time.
@@ -784,6 +889,7 @@ class PerfMonitor:
         return self.result({
             "profile_active": self._perf_profile_active,
             "recorded_functions": len(self._perf_profile),
+            "profile_noise": self._perf_profile_meta,
             "functions": rows,
             "note": "The CPU profile is parsed on Pause; record + interact + pause first."
                     if not rows else "",
