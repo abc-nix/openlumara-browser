@@ -19,6 +19,9 @@ class CdpEvents:
         params = data.get("params", {}) or {}
         sid = data.get("sessionId")
 
+        if getattr(self, "_perf_recording", False):
+            self._perf_record_event(method, sid, params)
+
         if method in ("Target.targetCreated", "Target.targetInfoChanged"):
             # events carry a sessionId, not an URL. Track the URL each tab
             # is on so a log entry can say which page it came from instead of

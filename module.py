@@ -32,13 +32,14 @@ from .tools_page import PageTools
 from .tools_session import SessionTools
 from .util import CALL_BUDGET, headless_from_version, timeout_text, tool_budget
 from .webui_routes import WebuiRoutes
+from .webui_perf import WebuiPerfRoutes
 
 
 # ---------------------------------------------------------------------------
 # The Module
 # ---------------------------------------------------------------------------
 
-class Browser(CdpEvents, RestartState, WebuiRoutes,
+class Browser(CdpEvents, RestartState, WebuiRoutes, WebuiPerfRoutes,
               SessionTools, PageTools, DataTools, core.module.Module):
     """
     Gives your AI its own Chrome/Chromium window to browse the web: open
@@ -152,6 +153,32 @@ class Browser(CdpEvents, RestartState, WebuiRoutes,
             "description": "Let the AI send raw Chrome DevTools Protocol commands directly. Advanced, off by default.",
             "default": False,
         },
+        "perf_interval_ms": {
+            "type": "number",
+            "description": "Browser monitor resource sampling interval in milliseconds for the selected tab. Lower is more detailed but costs more; 1000 ms is a good default.",
+            "default": 1000,
+            "min": 250,
+            "max": 10000,
+        },
+        "perf_history": {
+            "type": "number",
+            "description": "Number of resource samples kept per tab. At the default 1 s interval, 300 samples is 5 minutes.",
+            "default": 300,
+            "min": 30,
+            "max": 3600,
+        },
+        "perf_collect_fps": {
+            "type": "boolean",
+            "description": "Inject a tiny requestAnimationFrame + long-task probe into the selected tab to report FPS and long tasks.",
+            "default": True,
+        },
+        "perf_events_max": {
+            "type": "number",
+            "description": "Maximum number of events kept by the browser monitor event recorder.",
+            "default": 5000,
+            "min": 100,
+            "max": 50000,
+        },
     }
 
     # ------------------------------------------------------------------
@@ -187,10 +214,12 @@ class Browser(CdpEvents, RestartState, WebuiRoutes,
         self._http = aiohttp.ClientSession()
         self._started = True
         self._adopt_pidfile()
+        self.perf_init()
         self.log("browser", "Ready (browser will launch on first use)")
 
     async def on_shutdown(self):
         """Close the CDP connection and, only if we launched it, the browser."""
+        await self.perf_close()
         if self._cdp:
             try:
                 await self._cdp.close()
@@ -465,6 +494,7 @@ class Browser(CdpEvents, RestartState, WebuiRoutes,
         self._net_pending.clear()
         self._console_log.clear()
         self._network_log.clear()
+        self.perf_reset()
 
     async def _ensure_connection(self):
         """Make sure we have a live CDP connection + an attached tab."""
@@ -541,6 +571,10 @@ class Browser(CdpEvents, RestartState, WebuiRoutes,
         await self._cdp.cmd("Runtime.enable", {}, sid)
         await self._cdp.cmd("Log.enable", {}, sid)
         await self._cdp.cmd("Accessibility.enable", {}, sid)
+        try:
+            await self._cdp.cmd("Performance.enable", {}, sid)
+        except Exception:
+            pass
         if self.config.get("enable_network_monitoring", False):
             await self._cdp.cmd("Network.enable", {}, sid)
 

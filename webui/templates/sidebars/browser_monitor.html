@@ -1,0 +1,83 @@
+{# Browser monitor: left-panel selector.
+
+   Two libreta-style tabs switch the chat-column cover between Resources and
+   Events. The tab list below them is the browser's real page-tab list; the
+   selected row is the tab being sampled/recorded. #}
+<div class="bm-panel" x-data="BROWSER_MONITOR_PANEL" x-init="init()"
+     x-effect="document.body.toggleAttribute('data-bm', sidebarTab === 'browser/browser_monitor')"
+     x-cloak>
+
+    <div class="bm-head">
+        <span class="bm-title">Browser monitor</span>
+        <span class="bm-dot" :class="{ live: connected }" :title="connected ? 'connected' : 'not connected'"></span>
+    </div>
+
+    <div class="bm-subtabs" role="tablist">
+        <button type="button" class="bm-subtab" role="tab"
+                :class="{ on: mode === 'resources' }"
+                :aria-selected="mode === 'resources'"
+                title="Resources" @click="setMode('resources')">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16"
+                 fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 17l5-6 4 3 4-7 5 5"/><path d="M3 21h18"/>
+            </svg>
+            <span>Resources</span>
+        </button>
+        <button type="button" class="bm-subtab" role="tab"
+                :class="{ on: mode === 'events' }"
+                :aria-selected="mode === 'events'"
+                title="Events" @click="setMode('events')">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16"
+                 fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6 8a6 6 0 0 1 12 0v5l2 3H4l2-3z"/><path d="M10 19a2 2 0 0 0 4 0"/>
+            </svg>
+            <span>Events</span>
+        </button>
+    </div>
+
+    <div class="bm-tablist-head">
+        <span>Tabs</span>
+        <span x-text="targets.length"></span>
+    </div>
+    <div class="bm-tablist">
+        <template x-for="t in targets">
+            <button type="button" :key="t.id" class="bm-tabrow" :class="{ on: t.id === targetId }"
+                    :title="t.url || t.title" @click="selectTarget(t.id)">
+                <span class="bm-tabdot" :style="`background: ${t.color || 'var(--text-muted, #888)'}`"></span>
+                <span class="bm-tabmain">
+                    <span class="bm-tabtitle" x-text="t.title || t.id"></span>
+                    <span class="bm-taburl" x-text="t.url"></span>
+                </span>
+                <span class="bm-tabact" x-show="t.active" title="visible tab">●</span>
+            </button>
+        </template>
+        <div class="bm-empty" x-show="!targets.length">No browser tabs. Open the browser module first.</div>
+    </div>
+
+    <template x-if="mode === 'resources'">
+        <div class="bm-section">
+            <div class="bm-status" x-text="statusLine()"></div>
+            <div class="bm-mini" x-show="latest()">
+                <span x-text="latest() ? latest().fps + ' fps' : ''"></span>
+                <span x-text="latest() ? fmtMB(latest().heap) : ''"></span>
+                <span x-text="latest() ? fmtNum(latest().nodes) + ' nodes' : ''"></span>
+            </div>
+            <button type="button" class="bm-btn" @click="clearSamples()">Clear history</button>
+        </div>
+    </template>
+
+    <template x-if="mode === 'events'">
+        <div class="bm-section">
+            <div class="bm-actions">
+                <button type="button" class="bm-btn" :class="{ on: recording }"
+                        @click="toggleRecording()"
+                        x-text="recording ? 'Pause recording' : 'Record events'"></button>
+                <button type="button" class="bm-btn" @click="clearEvents()">Clear</button>
+            </div>
+            <div class="bm-status">
+                <span x-text="eventCount + ' events'"></span>
+                <span x-show="recording" class="bm-recording"> · recording</span>
+            </div>
+        </div>
+    </template>
+</div>

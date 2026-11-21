@@ -1,0 +1,284 @@
+{# Browser monitor cover, mounted through core's below_header slot inside
+   #chat-window. The sidebar selects Resources or Events; this cover renders the
+   real resource dashboard or the recorded event timeline. #}
+{% macro below_header() %}
+<div class="bm-cover" x-data="BROWSER_MONITOR_VIEW" x-init="init()" x-cloak>
+
+    <div class="bm-bar">
+        <span class="bm-bar-title">Browser monitor</span>
+        <span class="bm-crumb" x-text="modeLabel()"></span>
+        <span class="bm-crumb-sep">›</span>
+        <span class="bm-crumb-target" x-text="targetLabel()"></span>
+        <span class="bm-bar-spacer"></span>
+        <button type="button" class="bm-close" @click="closeOverlay()" title="close browser monitor">
+            × close
+        </button>
+    </div>
+
+    <div class="bm-body">
+
+        {# ---------------- RESOURCES ---------------- #}
+        <div class="bm-view" x-show="mode === 'resources'">
+            <div class="bm-hero">
+                <div class="bm-page">
+                    <span class="bm-page-icon" :style="`background: ${currentTarget()?.color || '#888'}`"
+                          x-text="pageInitials()"></span>
+                    <div class="bm-page-text">
+                        <div class="bm-page-title" x-text="targetLabel()"></div>
+                        <div class="bm-page-url" x-text="currentTarget()?.url || ''"></div>
+                        <div class="bm-chips">
+                            <span class="bm-chip live"><span class="bm-dot live"></span> live</span>
+                            <span class="bm-chip">1000 ms</span>
+                            <span class="bm-chip" x-text="samples.length + ' samples'"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="bm-health" :class="healthClass()">
+                    <div class="bm-health-ring" :style="`--pct: ${health()}%`">
+                        <span x-text="health()"></span>
+                    </div>
+                    <div class="bm-health-text">
+                        <span>Performance</span>
+                        <strong x-text="healthLabel()"></strong>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bm-kpis">
+                <div class="bm-kpi" :class="kpiClass('fps')">
+                    <div class="bm-kpi-top">
+                        <span class="bm-kpi-label">FPS</span>
+                        <span class="bm-trend" :class="trendClass('fps')" x-text="trendGlyph('fps')"></span>
+                    </div>
+                    <span class="bm-kpi-value" x-text="latest() ? latest().fps : '—'"></span>
+                    <span class="bm-kpi-unit">frames / s</span>
+                </div>
+                <div class="bm-kpi" :class="kpiClass('heap')">
+                    <div class="bm-kpi-top">
+                        <span class="bm-kpi-label">JS heap</span>
+                        <span class="bm-trend" :class="trendClass('heap')" x-text="trendGlyph('heap')"></span>
+                    </div>
+                    <span class="bm-kpi-value" x-text="latest() ? fmtMB(latest().heap) : '—'"></span>
+                    <span class="bm-kpi-unit" x-text="latest() ? fmtMB(latest().heap_total) + ' total' : ''"></span>
+                </div>
+                <div class="bm-kpi" :class="kpiClass('nodes')">
+                    <div class="bm-kpi-top">
+                        <span class="bm-kpi-label">DOM nodes</span>
+                        <span class="bm-trend" :class="trendClass('nodes')" x-text="trendGlyph('nodes')"></span>
+                    </div>
+                    <span class="bm-kpi-value" x-text="latest() ? fmtNum(latest().nodes) : '—'"></span>
+                    <span class="bm-kpi-unit" x-text="latest() ? latest().documents + ' documents' : ''"></span>
+                </div>
+                <div class="bm-kpi" :class="kpiClass('script_pct')">
+                    <div class="bm-kpi-top">
+                        <span class="bm-kpi-label">Script</span>
+                        <span class="bm-trend" :class="trendClass('script_pct')" x-text="trendGlyph('script_pct')"></span>
+                    </div>
+                    <span class="bm-kpi-value" x-text="latest() ? latest().script_pct + '%' : '—'"></span>
+                    <span class="bm-kpi-unit">of wall time</span>
+                </div>
+                <div class="bm-kpi" :class="kpiClass('task_pct')">
+                    <div class="bm-kpi-top">
+                        <span class="bm-kpi-label">Tasks</span>
+                        <span class="bm-trend" :class="trendClass('task_pct')" x-text="trendGlyph('task_pct')"></span>
+                    </div>
+                    <span class="bm-kpi-value" x-text="latest() ? latest().task_pct + '%' : '—'"></span>
+                    <span class="bm-kpi-unit">of wall time</span>
+                </div>
+                <div class="bm-kpi" :class="kpiClass('layout_per_s')">
+                    <div class="bm-kpi-top">
+                        <span class="bm-kpi-label">Layouts / s</span>
+                        <span class="bm-trend" :class="trendClass('layout_per_s')" x-text="trendGlyph('layout_per_s')"></span>
+                    </div>
+                    <span class="bm-kpi-value" x-text="latest() ? latest().layout_per_s : '—'"></span>
+                    <span class="bm-kpi-unit">style: <span x-text="latest() ? latest().style_per_s : '—'"></span> / s</span>
+                </div>
+                <div class="bm-kpi" :class="kpiClass('long_tasks')">
+                    <div class="bm-kpi-top">
+                        <span class="bm-kpi-label">Long tasks</span>
+                        <span class="bm-trend" :class="trendClass('long_tasks')" x-text="trendGlyph('long_tasks')"></span>
+                    </div>
+                    <span class="bm-kpi-value" x-text="latest() ? latest().long_tasks : '—'"></span>
+                    <span class="bm-kpi-unit" x-text="latest() ? 'longest ' + latest().longest_task + ' ms' : ''"></span>
+                </div>
+                <div class="bm-kpi" :class="kpiClass('listeners')">
+                    <div class="bm-kpi-top">
+                        <span class="bm-kpi-label">Event listeners</span>
+                        <span class="bm-trend" :class="trendClass('listeners')" x-text="trendGlyph('listeners')"></span>
+                    </div>
+                    <span class="bm-kpi-value" x-text="latest() ? fmtNum(latest().listeners) : '—'"></span>
+                    <span class="bm-kpi-unit">JS listeners</span>
+                </div>
+            </div>
+
+            <div class="bm-charts">
+                <div class="bm-chart">
+                    <div class="bm-chart-head">
+                        <span class="bm-chart-label">FPS</span>
+                        <span class="bm-chart-now" x-text="latest() ? latest().fps + ' fps' : ''"></span>
+                    </div>
+                    <svg class="bm-plot" viewBox="0 0 620 150" preserveAspectRatio="none" aria-hidden="true">
+                        <polygon :points="chartArea('fps')" class="bm-area"></polygon>
+                        <polyline :points="chartPoints('fps')" class="bm-line"></polyline>
+                    </svg>
+                    <div class="bm-chart-foot"><span>last 60 samples</span><span>1000 ms</span></div>
+                </div>
+                <div class="bm-chart">
+                    <div class="bm-chart-head">
+                        <span class="bm-chart-label">Script %</span>
+                        <span class="bm-chart-now" x-text="latest() ? latest().script_pct + '%' : ''"></span>
+                    </div>
+                    <svg class="bm-plot" viewBox="0 0 620 150" preserveAspectRatio="none" aria-hidden="true">
+                        <polygon :points="chartArea('script_pct')" class="bm-area"></polygon>
+                        <polyline :points="chartPoints('script_pct')" class="bm-line"></polyline>
+                    </svg>
+                    <div class="bm-chart-foot"><span>last 60 samples</span><span>1000 ms</span></div>
+                </div>
+                <div class="bm-chart">
+                    <div class="bm-chart-head">
+                        <span class="bm-chart-label">JS heap</span>
+                        <span class="bm-chart-now" x-text="latest() ? fmtMB(latest().heap) : ''"></span>
+                    </div>
+                    <svg class="bm-plot" viewBox="0 0 620 150" preserveAspectRatio="none" aria-hidden="true">
+                        <polygon :points="chartArea('heap')" class="bm-area"></polygon>
+                        <polyline :points="chartPoints('heap')" class="bm-line"></polyline>
+                    </svg>
+                    <div class="bm-chart-foot"><span>last 60 samples</span><span>1000 ms</span></div>
+                </div>
+            </div>
+
+            <div class="bm-foot">
+                <button type="button" class="bm-btn" @click="clearSamples()">Clear history</button>
+                <span class="bm-meta" x-text="latest() ? 'last sample ' + clock(latest().t) : ''"></span>
+                <span class="bm-meta" x-text="latest() ? latest().documents + ' documents · ' + latest().frames + ' frames · ' + fmtNum(latest().listeners) + ' listeners' : ''"></span>
+            </div>
+        </div>
+
+        {# ---------------- EVENTS ---------------- #}
+        <div class="bm-view" x-show="mode === 'events'">
+
+            <div class="bm-toolbar bm-event-bar">
+                <button type="button" class="bm-btn" :class="{ on: recording }"
+                        @click="toggleRecording()"
+                        x-text="recording ? 'Pause recording' : 'Record events'"></button>
+                <button type="button" class="bm-btn" @click="clearEvents()">Clear</button>
+                <span class="bm-event-live" :class="{ live: recording }">
+                    <span class="bm-dot" :class="{ live: recording }"></span>
+                    <span x-text="recording ? 'recording' : 'paused'"></span>
+                </span>
+                <span class="bm-meta"><span x-text="sessionTime()"></span> · <span x-text="eventCount + ' events'"></span></span>
+                <span class="bm-bar-spacer"></span>
+                <span class="bm-meta" x-text="'tab: ' + targetLabel()"></span>
+            </div>
+
+            <div class="bm-event-summary">
+                <div class="bm-sum-item">
+                    <span>Session</span>
+                    <strong x-text="sessionTime()"></strong>
+                </div>
+                <div class="bm-sum-item">
+                    <span>Events / s</span>
+                    <strong x-text="eventsPerSecond()"></strong>
+                </div>
+                <div class="bm-sum-item">
+                    <span>Slowest event</span>
+                    <strong x-text="slowestEvent() ? slowestEvent().duration.toFixed(1) + ' ms' : '—'"></strong>
+                </div>
+                <div class="bm-sum-item">
+                    <span>Main-thread block</span>
+                    <strong x-text="blockedMs() + ' ms'"></strong>
+                </div>
+                <div class="bm-sum-item bm-sum-handlers">
+                    <span>Top handlers</span>
+                    <div class="bm-handler-list">
+                        <template x-for="h in topHandlers()">
+                            <span class="bm-handler-pill" :key="h.name"><span x-text="h.name"></span><b x-text="h.count"></b></span>
+                        </template>
+                        <span class="bm-muted" x-show="!topHandlers().length">no handler calls yet</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bm-density" title="events per second, last 40 s">
+                <template x-for="v in density()">
+                    <span :key="$index" :style="`height: ${v}%`"></span>
+                </template>
+            </div>
+
+            <div class="bm-event-filters">
+                <div class="bm-filter-chips">
+                    <template x-for="k in filterKinds">
+                        <button type="button" :key="k" class="bm-filter-chip" :class="{ on: filterKind === k }"
+                                @click="setFilter(k)">
+                            <span x-text="filterLabel(k)"></span>
+                            <b x-text="filterCount(k)"></b>
+                        </button>
+                    </template>
+                </div>
+                <input class="bm-input" type="search" x-model="eventSearch"
+                       placeholder="Search events, handlers, targets…" aria-label="Search events">
+                <select class="bm-select bm-min-select" x-model.number="minDuration"
+                        aria-label="Minimum duration">
+                    <option value="0">all durations</option>
+                    <option value="4">≥ 4 ms</option>
+                    <option value="16">≥ 16 ms</option>
+                    <option value="50">≥ 50 ms</option>
+                </select>
+                <label class="bm-check">
+                    <input type="checkbox" x-model="duringScrollOnly"> during scroll
+                </label>
+            </div>
+
+            <div class="bm-event-layout">
+                <div class="bm-events-table-wrap">
+                    <div class="bm-events-head">
+                        <span>+ time</span><span>kind</span><span>event</span><span>target</span><span>handler</span><span>duration</span>
+                    </div>
+                    <div class="bm-events-scroll">
+                        <template x-for="e in filteredEvents()">
+                            <button type="button" :key="e.id" class="bm-ev-row"
+                                    :class="e.kind + ' ' + e.severity + (selectedEvent && selectedEvent.id === e.id ? ' sel' : '')"
+                                    @click="selectEvent(e)">
+                                <span class="bm-ev-time" x-text="fmtRel(e.rel_ms)"></span>
+                                <span class="bm-ev-kind"><i class="bm-kind-dot"></i><span x-text="e.kind"></span></span>
+                                <span class="bm-ev-name" x-text="e.name"></span>
+                                <span class="bm-ev-target" x-text="e.target"></span>
+                                <span class="bm-ev-handler" x-text="handlerName(e)"></span>
+                                <span class="bm-ev-dur" x-text="e.duration.toFixed(1) + ' ms'"></span>
+                            </button>
+                        </template>
+                        <div class="bm-empty" x-show="!filteredEvents().length">
+                            No events match these filters. Press Record events, then interact with the page.
+                        </div>
+                    </div>
+                </div>
+
+                <aside class="bm-event-detail" x-show="selectedEvent" x-cloak>
+                    <div class="bm-detail-head">
+                        <span x-text="selectedEvent?.name || 'event'"></span>
+                        <button type="button" class="bm-detail-close" @click="closeEvent()" title="close">×</button>
+                    </div>
+                    <div class="bm-detail-meta">
+                        <span class="bm-detail-kind" :class="selectedEvent?.kind" x-text="selectedEvent?.kind"></span>
+                        <span x-text="selectedEvent ? fmtRel(selectedEvent.rel_ms) : ''"></span>
+                        <span x-text="selectedEvent ? selectedEvent.duration.toFixed(1) + ' ms' : ''"></span>
+                    </div>
+                    <div class="bm-detail-row"><span>target</span><code x-text="selectedEvent?.target || ''"></code></div>
+                    <div class="bm-detail-row"><span>handler</span><code x-text="handlerName(selectedEvent)"></code></div>
+                    <div class="bm-detail-row"><span>during scroll</span><code x-text="selectedEvent?.during_scroll ? 'yes' : 'no'"></code></div>
+                    <div class="bm-detail-section">
+                        <span>source</span>
+                        <pre class="bm-detail-source" x-text="selectedEvent?.handler?.source || ''"></pre>
+                    </div>
+                    <div class="bm-detail-section">
+                        <span>stack</span>
+                        <pre class="bm-detail-stack" x-text="(selectedEvent?.stack || []).join('\\n')"></pre>
+                    </div>
+                    <button type="button" class="bm-btn" @click="closeEvent()">Close</button>
+                </aside>
+            </div>
+        </div>
+
+    </div>
+</div>
+{% endmacro %}
