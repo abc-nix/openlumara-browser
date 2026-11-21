@@ -12,6 +12,8 @@ import json
 import time
 from collections import deque
 
+import core
+
 AGENT_JS = r"""
 (() => {
   if (window.__olMonitor) return "exists";
@@ -46,11 +48,19 @@ AGENT_JS = r"""
   };
 
   try {
-    new PerformanceObserver((list) => list.getEntries().forEach((e) =>
-      M.push({kind: 'longtask', name: e.name || 'longtask', duration: e.duration,
-              target: 'main thread', handler: null, data: {},
-              severity: e.duration > 50 ? 'warn' : 'info'})
-    )).observe({entryTypes: ['longtask', 'long-animation-frame']});
+    new PerformanceObserver((list) => list.getEntries().forEach((e) => {
+      const scripts = (e.scripts || []).slice(0, 12).map((s) => ({
+        name: s.sourceFunctionName || s.invoker || 'anonymous',
+        url: s.sourceURL || '',
+        position: s.sourceCharPosition || 0,
+        invoker: s.invoker || '',
+        duration: Math.round((s.duration || 0) * 10) / 10,
+      }));
+      M.push({kind: 'longtask', name: e.name || e.entryType || 'longtask',
+              duration: e.duration, target: 'main thread', handler: null,
+              data: {scripts: scripts, entryType: e.entryType},
+              severity: e.duration > 50 ? 'warn' : 'info'});
+    })).observe({entryTypes: ['longtask', 'long-animation-frame']});
   } catch (e) {}
 
   try {
@@ -233,6 +243,9 @@ class PerfMonitor:
         self._perf_session_start = 0
         self._perf_event_log = deque(maxlen=max(int(self.config.get("perf_events_max", 5000) or 5000), 100))
         self._perf_event_seq = 0
+        self._perf_profile = []
+        self._perf_profile_active = False
+        self._perf_profile_sid = None
         self._perf_stop = asyncio.Event()
         self._perf_task = asyncio.create_task(self._perf_loop())
 
@@ -250,6 +263,9 @@ class PerfMonitor:
     def perf_reset(self):
         self._perf_selected_target = None
         self._perf_recording = False
+        self._perf_profile = []
+        self._perf_profile_active = False
+        self._perf_profile_sid = None
         for name in ("_perf_samples", "_perf_last_metrics", "_perf_event_log"):
             bucket = getattr(self, name, None)
             if bucket is not None and hasattr(bucket, "clear"):
@@ -329,6 +345,103 @@ class PerfMonitor:
                                 sid, timeout=2.0)
         except Exception:
             pass
+
+    async def _perf_profile_start(self):
+        target = self._perf_selected_target
+        if not target or not self._is_connected():
+            return
+        if target not in self._attached:
+            try:
+                await self._attach_target(target)
+            except Exception:
+                return
+        sid = self._attached.get(target)
+        if not sid:
+            return
+        try:
+            await self._cdp.cmd("Profiler.enable", {}, sid, timeout=2.0)
+            await self._cdp.cmd("Profiler.setSamplingInterval", {"interval": 1000}, sid, timeout=2.0)
+            await self._cdp.cmd("Profiler.start", {}, sid, timeout=2.0)
+            self._perf_profile_active = True
+            self._perf_profile_sid = sid
+        except Exception:
+            self._perf_profile_active = False
+            self._perf_profile_sid = None
+
+    async def _perf_profile_stop(self):
+        if not self._perf_profile_active:
+            return
+        sid = self._perf_profile_sid
+        self._perf_profile_active = False
+        self._perf_profile_sid = None
+        if not sid:
+            return
+        try:
+            res = await self._cdp.cmd("Profiler.stop", {}, sid, timeout=5.0)
+            profile = (res or {}).get("profile") or {}
+            self._perf_profile = self._perf_profile_parse(profile)
+        except Exception:
+            self._perf_profile = []
+
+    def _perf_profile_parse(self, profile):
+        nodes = {n["id"]: n for n in (profile.get("nodes") or [])
+                 if isinstance(n, dict) and n.get("id") is not None}
+        samples = profile.get("samples") or []
+        deltas = profile.get("timeDeltas") or []
+        self_ms = {}
+        counts = {}
+        for i, node_id in enumerate(samples):
+            dt = _number(deltas[i]) if i < len(deltas) else 0
+            self_ms[node_id] = self_ms.get(node_id, 0.0) + max(dt, 0) / 1000.0
+            counts[node_id] = counts.get(node_id, 0) + 1
+
+        parent = {}
+        for node_id, node in nodes.items():
+            for child in node.get("children") or []:
+                parent[child] = node_id
+
+        total = dict(self_ms)
+        for node_id, value in list(self_ms.items()):
+            cur = node_id
+            seen = set()
+            while cur in parent and cur not in seen:
+                seen.add(cur)
+                cur = parent[cur]
+                total[cur] = total.get(cur, 0.0) + value
+
+        groups = {}
+        for node_id, node in nodes.items():
+            frame = node.get("callFrame") or {}
+            name = frame.get("functionName") or "(anonymous)"
+            if name == "(root)":
+                continue
+            url = frame.get("url") or ""
+            line = int(frame.get("lineNumber") or 0) + 1
+            key = (name, url, line)
+            row = groups.get(key)
+            if row is None:
+                row = {
+                    "name": name,
+                    "source": f"{url}:{line}" if url else "",
+                    "url": url,
+                    "line": line,
+                    "self_ms": 0.0,
+                    "total_ms": 0.0,
+                    "calls": 0,
+                }
+                groups[key] = row
+            row["self_ms"] += self_ms.get(node_id, 0.0)
+            row["total_ms"] += total.get(node_id, 0.0)
+            row["calls"] += counts.get(node_id, 0)
+
+        rows = [r for r in groups.values() if r["self_ms"] > 0 or r["total_ms"] > 0]
+        rows.sort(key=lambda r: (r["total_ms"], r["self_ms"]), reverse=True)
+        result = []
+        for row in rows[:30]:
+            row["self_ms"] = round(row["self_ms"], 1)
+            row["total_ms"] = round(row["total_ms"], 1)
+            result.append(row)
+        return result
 
     async def _perf_drain_events(self):
         target = self._perf_selected_target
@@ -449,7 +562,9 @@ class PerfMonitor:
         self._perf_last_metrics.pop(target_id, None)
         self._perf_samples[target_id] = deque(maxlen=self._perf_history)
         if self._perf_recording:
+            await self._perf_profile_stop()
             await self._perf_agent_start()
+            await self._perf_profile_start()
         return {"selected": target_id}
 
     def _perf_session_seconds(self):
@@ -489,11 +604,14 @@ class PerfMonitor:
         if recording:
             self._perf_event_log.clear()
             self._perf_event_seq = 0
+            self._perf_profile = []
             self._perf_session_start = time.time() * 1000
             self._perf_recording = True
             await self._perf_agent_start()
+            await self._perf_profile_start()
         else:
             self._perf_recording = False
+            await self._perf_profile_stop()
             try:
                 target = self._perf_selected_target
                 sid = self._attached.get(target) if target else None
@@ -517,14 +635,210 @@ class PerfMonitor:
             "recording": self._perf_recording,
             "session_seconds": self._perf_session_seconds(),
             "event_count": len(self._perf_event_log),
+            "functions": self._perf_profile,
+            "profile_active": self._perf_profile_active,
             "events": events[-max(int(limit or 300), 1):],
         }
 
     async def _perf_clear_events(self):
         self._perf_event_log.clear()
+        self._perf_profile = []
         self._perf_session_start = 0
         self._perf_recording = False
         return {"recording": False, "event_count": 0, "session_seconds": 0}
+
+    # ------------------------------------------------------------------
+    # AI tools: read what the monitor recorded
+    # ------------------------------------------------------------------
+    def _perf_top_handlers(self, events, limit=8):
+        by_name = {}
+        for e in events:
+            handler = e.get("handler") or {}
+            name = handler.get("name") if isinstance(handler, dict) else None
+            if not name or name == "—":
+                continue
+            row = by_name.setdefault(name, {"name": name, "calls": 0, "ms": 0.0})
+            row["calls"] += 1
+            row["ms"] += _number(e.get("duration"))
+        rows = sorted(by_name.values(), key=lambda r: (r["ms"], r["calls"]), reverse=True)
+        for row in rows:
+            row["ms"] = round(row["ms"], 1)
+        return rows[:limit]
+
+    async def browser_monitor_summary(self):
+        """Summarize the browser monitor's current state and last recording.
+
+        Returns resource snapshot values, event counts by kind, the slowest
+        events, top handlers by time, and the top functions from the last CPU
+        profile. Use this first to decide what to inspect with
+        browser_monitor_events or browser_monitor_functions.
+        """
+        events = list(self._perf_event_log)
+        counts = {}
+        for e in events:
+            kind = e.get("kind", "?")
+            counts[kind] = counts.get(kind, 0) + 1
+        slowest = sorted(events, key=lambda e: _number(e.get("duration")), reverse=True)[:5]
+        slowest_rows = [{
+            "id": e.get("id"), "rel_ms": e.get("rel_ms"), "kind": e.get("kind"),
+            "name": e.get("name"), "duration_ms": _number(e.get("duration")),
+            "during_scroll": bool(e.get("during_scroll")),
+        } for e in slowest]
+        samples = list(self._perf_samples.get(self._perf_selected_target, ()))
+        latest = samples[-1] if samples else None
+        return self.result({
+            "connected": self._is_connected(),
+            "selected_tab": self._perf_selected_target,
+            "recording": self._perf_recording,
+            "session_seconds": self._perf_session_seconds(),
+            "event_count": len(events),
+            "event_counts": counts,
+            "slowest_events": slowest_rows,
+            "top_handlers": self._perf_top_handlers(events),
+            "profile_active": self._perf_profile_active,
+            "top_functions": self._perf_profile[:10],
+            "resource_latest": latest,
+            "resource_samples": len(samples),
+        }, success=True)
+
+    async def browser_monitor_events(self, kinds: list = None, min_duration_ms: float = 0,
+                                     during_scroll: bool = None, search: str = "",
+                                     since_ms: float = None, until_ms: float = None,
+                                     include_details: bool = False, limit: int = 50):
+        """Read the recorded event timeline with optional filters.
+
+        Args:
+            kinds: only these event kinds (e.g. ["scroll", "longtask", "input", "error"]).
+            min_duration_ms: only events at least this long.
+            during_scroll: true/false to keep only events inside/outside scroll windows.
+            search: case-insensitive text match over event, target and handler.
+            since_ms / until_ms: session-relative window in milliseconds.
+            include_details: include handler source/stack and event data.
+            limit: maximum events to return (capped at 200).
+        """
+        wanted = set(kinds or [])
+        term = str(search or "").lower()
+        rows = []
+        for e in self._perf_event_log:
+            rel = _number(e.get("rel_ms"))
+            if wanted and e.get("kind") not in wanted:
+                continue
+            if _number(e.get("duration")) < _number(min_duration_ms):
+                continue
+            if during_scroll is not None and bool(e.get("during_scroll")) != bool(during_scroll):
+                continue
+            if since_ms is not None and rel < _number(since_ms):
+                continue
+            if until_ms is not None and rel > _number(until_ms):
+                continue
+            if term:
+                handler = e.get("handler") or {}
+                hay = f"{e.get('kind', '')} {e.get('name', '')} {e.get('target', '')} " \
+                      f"{handler.get('name', '') if isinstance(handler, dict) else ''}".lower()
+                if term not in hay:
+                    continue
+            row = {
+                "id": e.get("id"), "rel_ms": rel, "kind": e.get("kind"),
+                "name": e.get("name"), "duration_ms": _number(e.get("duration")),
+                "target": e.get("target"), "severity": e.get("severity"),
+                "during_scroll": bool(e.get("during_scroll")),
+                "handler_name": (e.get("handler") or {}).get("name")
+                                if isinstance(e.get("handler"), dict) else "—",
+            }
+            if include_details:
+                row["handler"] = e.get("handler")
+                row["data"] = e.get("data")
+            rows.append(row)
+        rows.sort(key=lambda r: r["rel_ms"])
+        cap = max(min(int(limit or 50), 200), 1)
+        return self.result({
+            "matched": len(rows), "returned": min(len(rows), cap),
+            "recording": self._perf_recording,
+            "session_seconds": self._perf_session_seconds(),
+            "events": rows[-cap:],
+        }, success=True)
+
+    async def browser_monitor_functions(self, min_total_ms: float = 0, limit: int = 20):
+        """Read the top functions from the last CPU profile.
+
+        The profile is collected while recording and parsed when recording is
+        paused. If the list is empty, record, interact, then pause first.
+
+        Args:
+            min_total_ms: only functions with at least this total time.
+            limit: maximum functions to return.
+        """
+        rows = [f for f in self._perf_profile
+                if _number(f.get("total_ms")) >= _number(min_total_ms)]
+        rows = rows[:max(min(int(limit or 20), 100), 1)]
+        return self.result({
+            "profile_active": self._perf_profile_active,
+            "recorded_functions": len(self._perf_profile),
+            "functions": rows,
+            "note": "The CPU profile is parsed on Pause; record + interact + pause first."
+                    if not rows else "",
+        }, success=True)
+
+    async def browser_monitor_resources(self, target_id: str = None, limit: int = 60):
+        """Read recent resource samples for the monitor's selected tab.
+
+        Args:
+            target_id: tab target id; defaults to the selected monitor tab.
+            limit: number of recent samples to return.
+        """
+        target = target_id or self._perf_selected_target
+        samples = list(self._perf_samples.get(target, ()))
+        cap = max(min(int(limit or 60), 300), 1)
+        return self.result({
+            "target_id": target,
+            "samples_returned": len(samples[-cap:]),
+            "latest": samples[-1] if samples else None,
+            "samples": samples[-cap:],
+        }, success=True)
+
+    @core.module.tool
+    async def browser_monitor(self, view: str = "all", kinds: list = None,
+                              min_duration_ms: float = 0, during_scroll: bool = None,
+                              search: str = "", since_ms: float = None,
+                              until_ms: float = None, include_details: bool = False,
+                              limit: int = 50, min_total_ms: float = 0,
+                              target_id: str = None):
+        """Read the browser monitor's recording and resource data.
+
+        Args:
+            view: what to return: all, summary, events, functions, resources.
+            kinds: event kinds filter for events.
+            min_duration_ms: minimum event duration for events.
+            during_scroll: only inside/outside scroll windows for events.
+            search: text match over event, target and handler for events.
+            since_ms / until_ms: session-relative window for events.
+            include_details: include handler source/stack and event data.
+            limit: maximum events (or resource samples) to return.
+            min_total_ms: minimum total time for functions.
+            target_id: resource tab; defaults to the monitor's selected tab.
+        """
+        def content(result):
+            return result.get("content", result) if isinstance(result, dict) else result
+
+        view = str(view or "all").lower()
+        if view not in ("all", "summary", "events", "functions", "resources"):
+            view = "all"
+        data = {"view": view, "recording": self._perf_recording,
+                "session_seconds": self._perf_session_seconds()}
+        if view in ("all", "summary"):
+            data["summary"] = content(await self.browser_monitor_summary())
+        if view in ("all", "events"):
+            data["events"] = content(await self.browser_monitor_events(
+                kinds=kinds, min_duration_ms=min_duration_ms, during_scroll=during_scroll,
+                search=search, since_ms=since_ms, until_ms=until_ms,
+                include_details=include_details, limit=limit))
+        if view in ("all", "functions"):
+            data["functions"] = content(await self.browser_monitor_functions(
+                min_total_ms=min_total_ms, limit=limit))
+        if view in ("all", "resources"):
+            data["resources"] = content(await self.browser_monitor_resources(
+                target_id=target_id, limit=limit))
+        return self.result(data, success=True)
 
 
 def core_detail_error(exc):

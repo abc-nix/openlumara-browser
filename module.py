@@ -33,6 +33,7 @@ from .tools_session import SessionTools
 from .util import CALL_BUDGET, headless_from_version, timeout_text, tool_budget
 from .webui_routes import WebuiRoutes
 from .webui_perf import WebuiPerfRoutes
+from .perf import PerfMonitor
 
 
 # ---------------------------------------------------------------------------
@@ -659,7 +660,7 @@ def _adopt_tools(cls):
     the class object. WebUI routes need no such trick - the server walks the
     MRO - which is why only tools are copied.
     """
-    for mixin in (SessionTools, PageTools, DataTools):
+    for mixin in (SessionTools, PageTools, DataTools, PerfMonitor):
         for name, member in vars(mixin).items():
             if getattr(member, "_is_tool", False):
                 setattr(cls, name, member)

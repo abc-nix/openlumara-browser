@@ -614,3 +614,48 @@ body[data-bm] .bm-cover { display: flex; }
     overflow: auto;
     max-height: 100px;
 }
+
+/* CPU-profile function table */
+.bm-function-panel {
+    border: 1px solid var(--border, #333);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.015);
+    overflow: hidden;
+}
+.bm-function-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--border, #333);
+    background: var(--bg-secondary, #1c1c1c);
+    color: var(--text-muted, #888);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+.bm-function-cols,
+.bm-function-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.4fr) 72px 72px 54px;
+    gap: 8px;
+    align-items: baseline;
+    padding: 4px 10px;
+}
+.bm-function-cols {
+    color: var(--text-muted, #888);
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+.bm-function-list { max-height: 150px; overflow: auto; }
+.bm-function-row {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.035);
+    font-size: 10.5px;
+}
+.bm-function-row:hover { background: rgba(255, 255, 255, 0.04); }
+.bm-fn-name { color: var(--accent, #4aa3ff); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bm-fn-source { color: var(--text-muted, #888); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bm-fn-self, .bm-fn-total, .bm-fn-calls { color: var(--text-secondary, #bbb); font-variant-numeric: tabular-nums; text-align: right; }

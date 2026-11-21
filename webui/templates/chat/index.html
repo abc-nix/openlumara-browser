@@ -199,6 +199,27 @@
                 </div>
             </div>
 
+            <div class="bm-function-panel" x-show="profileFunctions.length">
+                <div class="bm-function-head">
+                    <span>Functions · CPU profile</span>
+                    <span x-text="profileFunctions.length + ' functions'"></span>
+                </div>
+                <div class="bm-function-cols">
+                    <span>function</span><span>source</span><span>self</span><span>total</span><span>calls</span>
+                </div>
+                <div class="bm-function-list">
+                    <template x-for="f in profileFunctions">
+                        <div :key="f.name + f.source" class="bm-function-row">
+                            <span class="bm-fn-name" x-text="f.name"></span>
+                            <span class="bm-fn-source" x-text="f.source || ''"></span>
+                            <span class="bm-fn-self" x-text="f.self_ms + ' ms'"></span>
+                            <span class="bm-fn-total" x-text="f.total_ms + ' ms'"></span>
+                            <span class="bm-fn-calls" x-text="f.calls"></span>
+                        </div>
+                    </template>
+                </div>
+            </div>
+
             <div class="bm-density" title="events per second, last 40 s">
                 <template x-for="v in density()">
                     <span :key="$index" :style="`height: ${v}%`"></span>
@@ -273,6 +294,10 @@
                     <div class="bm-detail-section">
                         <span>stack</span>
                         <pre class="bm-detail-stack" x-text="(selectedEvent?.stack || []).join('\\n')"></pre>
+                    </div>
+                    <div class="bm-detail-section" x-show="selectedEvent?.data?.scripts?.length">
+                        <span>scripts in this frame</span>
+                        <pre class="bm-detail-stack" x-text="(selectedEvent?.data?.scripts || []).map(s => (s.name || 'anonymous') + ' · ' + (s.duration || 0) + ' ms · ' + (s.url || '')).join(' · ')"></pre>
                     </div>
                     <button type="button" class="bm-btn" @click="closeEvent()">Close</button>
                 </aside>

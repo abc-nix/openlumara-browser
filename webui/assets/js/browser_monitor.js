@@ -17,6 +17,8 @@ const BROWSER_MONITOR = {
     connected: false,
     recording: false,
     eventCount: 0,
+    profileFunctions: [],
+    profileActive: false,
     sessionSecondsValue: 0,
     intervalMs: 1000,
     error: '',
@@ -123,6 +125,8 @@ const BROWSER_MONITOR = {
             this.recording = !!r.recording;
             this.sessionSecondsValue = r.session_seconds || 0;
             this.eventCount = r.event_count || 0;
+            this.profileFunctions = r.functions || [];
+            this.profileActive = !!r.profile_active;
             this.events = r.events || [];
         } catch (e) {
             this.connected = false;
@@ -175,6 +179,8 @@ const BROWSER_MONITOR = {
             await simpleApiPost('/api/ext/browser/perf/events/clear', {});
             this.events = [];
             this.eventCount = 0;
+            this.profileFunctions = [];
+            this.profileActive = false;
             this.sessionSecondsValue = 0;
             this.selectedEvent = null;
         } catch (e) {
