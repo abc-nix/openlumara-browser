@@ -20,13 +20,19 @@ AGENT_JS = r"""
   const M = window.__olMonitor = {
     enabled: true, installed: false, events: [], agg: {}, cap: 1200, slowMs: 8,
     sessionStart: performance.now(), scrollAt: -1e9, seq: 0,
-    push(e) {
+    // `at` is the entry's own startTime (performance timeline, same origin as
+    // performance.now()). A PerformanceObserver delivers entries in batches
+    // after the fact, so stamping at drain time collapses a burst onto one
+    // instant and puts LoAF entries a frame late. Clamped at 0 for a frame that
+    // was already running when recording started.
+    push(e, at) {
       if (!this.enabled) return;
+      const base = (at === undefined || at === null) ? performance.now() : at;
       this.seq += 1;
       e.id = 'e' + this.seq;
-      e.rel_ms = Math.round((performance.now() - this.sessionStart) * 10) / 10;
+      e.rel_ms = Math.max(0, Math.round((base - this.sessionStart) * 10) / 10);
       e.wall_ms = Date.now();
-      e.during_scroll = !!e.during_scroll || (performance.now() - this.scrollAt < 200);
+      e.during_scroll = !!e.during_scroll || (base - this.scrollAt < 200);
       e.severity = e.severity || (Number(e.duration) > 50 ? 'warn' : 'info');
       e.tab = this.tab || null;
       this.events.push(e);
@@ -37,9 +43,9 @@ AGENT_JS = r"""
     // every call over CDP drowns the timeline in events that carry no signal.
     // One row per (handler, event type, registration site); an individual event
     // is kept only when a call is actually slow.
-    note(type, el, listener, site, dur) {
+    note(type, el, listener, site, dur, startedAt) {
       if (!this.enabled) return;
-      const now = performance.now();
+      const now = startedAt === undefined || startedAt === null ? performance.now() : startedAt;
       const name = listener.name || 'anonymous';
       const key = type + '|' + name + '|' + ((site && site[0]) || '');
       let row = this.agg[key];
@@ -63,7 +69,7 @@ AGENT_JS = r"""
       this.push({kind: 'input', name: type, duration: dur, target: describe(el),
                  handler: {name: name, source: String(listener).slice(0, 300),
                            stack: stack, site: site},
-                 data: {}, during_scroll: now - this.scrollAt < 200});
+                 data: {}, during_scroll: now - this.scrollAt < 200}, now);
     },
     // A long task has no render phases; a long animation frame does. Splitting
     // it into work / render / style+layout is what says whether a frame was JS
@@ -126,14 +132,17 @@ AGENT_JS = r"""
       kind: 'longtask', name: e.name || e.entryType || 'longtask',
       duration: e.duration, target: 'main thread', handler: null,
       data: M.frameData(e), severity: e.duration > 50 ? 'warn' : 'info',
-    }))).observe({entryTypes: ['longtask', 'long-animation-frame']});
+    }, e.startTime))).observe({entryTypes: ['longtask', 'long-animation-frame']});
   } catch (e) {}
 
   try {
     new PerformanceObserver((list) => list.getEntries().forEach((e) =>
       M.push({kind: 'input', name: e.name, duration: e.duration,
               target: 'event timing', handler: null,
-              data: {interactionId: e.interactionId, processingStart: e.processingStart, processingEnd: e.processingEnd}})
+              data: {interactionId: e.interactionId, processingStart: e.processingStart,
+                     processingEnd: e.processingEnd,
+                     delay_ms: Math.max(0, Math.round(((e.processingStart || 0) - (e.startTime || 0)) * 10) / 10)}},
+             e.startTime)
     )).observe({entryTypes: ['event']});
   } catch (e) {}
 
@@ -179,7 +188,7 @@ AGENT_JS = r"""
           if (!M.enabled) return listener.call(this, ev);
           const t0 = performance.now();
           try { return listener.call(this, ev); }
-          finally { M.note(type, this, listener, site, performance.now() - t0); }
+          finally { M.note(type, this, listener, site, performance.now() - t0, t0); }
         };
         w.__olOriginal = listener;
         byType[type] = w;
