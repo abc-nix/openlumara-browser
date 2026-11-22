@@ -73,6 +73,11 @@
 
     <template x-if="mode === 'events'">
         <div class="bm-section">
+            <div class="bm-name">
+                <input class="bm-input bm-name-input" type="text" maxlength="60" x-model="sessionLabel"
+                       placeholder="name the next take (optional)"
+                       title="used for the take you start next; any saved take can be renamed later with the pencil">
+            </div>
             <div class="bm-actions">
                 <button type="button" class="bm-btn" :class="{ on: recording }"
                         @click="toggleRecording()"
@@ -92,12 +97,23 @@
             <div class="bm-tablist bm-savedlist">
                 <template x-for="r in recordings">
                     <div :key="r.id" class="bm-tabrow" :class="{ on: reviewId === r.id }">
-                        <button type="button" class="bm-savedmain" @click="openRecording(r.id)"
-                                :title="(r.tab_url || r.id) + ' — ' + (r.saved_at_local || '')">
-                            <span class="bm-tabtitle" x-text="r.label || r.started_at_local || r.saved_at_local || r.id"></span>
-                            <span class="bm-taburl" x-text="(r.session_seconds || 0) + 's · ' + (r.event_count || 0) + ' events · ' + (r.long_frames || 0) + ' long' + (r.events_dropped ? ' · ' + r.events_dropped + ' dropped' : '')"></span>
-                            <span class="bm-taburl" x-text="r.tab_url || ''"></span>
-                        </button>
+                        <template x-if="renamingId !== r.id">
+                            <button type="button" class="bm-savedmain" @click="openRecording(r.id)"
+                                    :title="(r.tab_url || r.id) + ' — ' + (r.saved_at_local || '')">
+                                <span class="bm-tabtitle" x-text="r.label || r.started_at_local || r.saved_at_local || r.id"></span>
+                                <span class="bm-taburl" x-text="(r.session_seconds || 0) + 's · ' + (r.event_count || 0) + ' events · ' + (r.long_frames || 0) + ' long' + (r.events_dropped ? ' · ' + r.events_dropped + ' dropped' : '')"></span>
+                                <span class="bm-taburl" x-text="r.tab_url || ''"></span>
+                            </button>
+                        </template>
+                        <template x-if="renamingId === r.id">
+                            <input class="bm-input bm-rename" type="text" maxlength="60" x-model="renameText"
+                                   x-init="$el.focus()"
+                                   @keydown.enter.stop.prevent="saveRename(r.id)"
+                                   @keydown.escape.stop.prevent="cancelRename()"
+                                   @blur="saveRename(r.id)">
+                        </template>
+                        <button type="button" class="bm-del bm-edit" x-show="renamingId !== r.id"
+                                @click.stop="startRename(r)" title="rename">✎</button>
                         <button type="button" class="bm-del" @click.stop="deleteRecording(r.id)" title="delete">×</button>
                     </div>
                 </template>

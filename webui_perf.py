@@ -26,7 +26,8 @@ class WebuiPerfRoutes(PerfMonitor):
 
     @webui.route("perf/record", method="POST")
     async def _route_perf_record(self, body=None, query=None):
-        return await self._perf_set_recording((body or {}).get("recording"))
+        body = body or {}
+        return await self._perf_set_recording(body.get("recording"), body.get("label"))
 
     @webui.route("perf/events")
     async def _route_perf_events(self, body=None, query=None):
@@ -67,6 +68,11 @@ class WebuiPerfRoutes(PerfMonitor):
             min_total_ms=number("min_total_ms") or 0,
             limit=int(number("limit") or 25),
             since_ms=number("since_ms"), until_ms=number("until_ms"))
+
+    @webui.route("perf/recordings/label", method="POST")
+    async def _route_perf_recordings_label(self, body=None, query=None):
+        body = body or {}
+        return self._perf_rename_recording(body.get("id"), body.get("label"))
 
     @webui.route("perf/recordings/delete", method="POST")
     async def _route_perf_recordings_delete(self, body=None, query=None):

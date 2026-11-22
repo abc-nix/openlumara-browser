@@ -48,6 +48,11 @@ const BROWSER_MONITOR = {
     eventsDropped: 0,
     eventsDroppedBeforeMs: 0,
     lastSessionId: '',
+    // Name for the next take (typed before Record) and the inline rename
+    // state for a take already on disk.
+    sessionLabel: '',
+    renamingId: '',
+    renameText: '',
     recordings: [],
     reviewId: '',
     reviewInfoText: '',
@@ -259,6 +264,41 @@ const BROWSER_MONITOR = {
         }
     },
 
+    startRename(row) {
+        if (!row || !row.id) return;
+        this.renamingId = row.id;
+        this.renameText = row.label || '';
+    },
+
+    cancelRename() {
+        this.renamingId = '';
+        this.renameText = '';
+    },
+
+    async saveRename(id) {
+        // enter fires the save and the input's blur fires it again; escape
+        // clears the state and the blur would then save the old text back. Both
+        // are handled by only acting while that row is still the one being
+        // edited.
+        if (!id || this.renamingId !== id) return;
+        const label = (this.renameText || '').trim().slice(0, 60);
+        this.renamingId = '';
+        this.renameText = '';
+        try {
+            await simpleApiPost('/api/ext/browser/perf/recordings/label', { id, label });
+            await this.refreshRecordings();
+            if (this.reviewId === id) {
+                const row = this.recordings.find((r) => r.id === id);
+                if (row) {
+                    this.reviewInfoText = [row.label, row.started_at_local, row.tab_title || row.tab_url,
+                                           (row.session_seconds || 0) + 's'].filter(Boolean).join(' · ');
+                }
+            }
+        } catch (e) {
+            this.error = 'could not rename ' + id + ' (' + this.errText(e) + ')';
+        }
+    },
+
     closeReview() {
         this.reviewId = '';
         this.reviewInfoText = '';
@@ -306,8 +346,10 @@ const BROWSER_MONITOR = {
         if (this.busy) return;
         this.busy = true;
         try {
+            const starting = !this.recording;
             const r = await simpleApiPost('/api/ext/browser/perf/record', {
-                recording: !this.recording,
+                recording: starting,
+                label: starting ? this.sessionLabel : '',
             });
             this.recording = !!r.recording;
             this.eventCount = r.event_count || 0;

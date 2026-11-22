@@ -164,6 +164,9 @@
             </div>
 
             <div class="bm-toolbar bm-event-bar">
+                <input class="bm-input bm-cover-name" type="text" maxlength="60" x-model="sessionLabel"
+                       placeholder="take name" x-show="!recording"
+                       title="used for the take you start next; saved takes are renamed in the Browser Monitor tab">
                 <button type="button" class="bm-btn" :class="{ on: recording }"
                         @click="toggleRecording()"
                         x-text="recording ? 'Pause recording' : 'Record events'"></button>
@@ -174,6 +177,7 @@
                 </span>
                 <span class="bm-meta"><span x-text="sessionTime()"></span> · <span x-text="eventCount + ' events'"></span></span>
                 <span class="bm-meta" x-show="lastSessionId" :title="'saved to data/browser/recordings'" x-text="'saved: ' + lastSessionId"></span>
+                <span class="bm-meta" x-show="recording && sessionLabel" x-text="'name: ' + sessionLabel"></span>
                 <span class="bm-meta bm-dropped" x-show="eventsDropped" :title="'the event log hit its cap; the oldest rows of this take are gone'" x-text="droppedNote()"></span>
                 <span class="bm-bar-spacer"></span>
                 <span class="bm-meta" x-text="'tab: ' + targetLabel()"></span>

@@ -819,6 +819,14 @@ body[data-bm] .bm-cover { display: flex; }
     line-height: 1;
 }
 .bm-del:hover { color: #e05c5c; background: rgba(224, 92, 92, 0.12); }
+/* Naming a take: the field above Record in the sidebar, the compact one in the
+   cover's event bar, and the inline rename input that replaces a saved row. */
+.bm-name { padding: 0 0 6px; }
+.bm-name-input { width: 100%; min-width: 0; font-size: 11px; padding: 4px 7px; }
+.bm-cover-name { min-width: 0; flex: 0 1 150px; font-size: 11px; padding: 4px 7px; }
+.bm-rename { min-width: 0; flex: 1 1 auto; font-size: 11px; padding: 4px 6px; }
+.bm-edit { font-size: 12px; }
+.bm-edit:hover { color: var(--accent, #4aa3ff); background: rgba(74, 163, 255, 0.12); }
 .bm-review {
     display: flex;
     align-items: center;

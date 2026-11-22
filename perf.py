@@ -1223,7 +1223,7 @@ class PerfMonitor:
             self._perf_probe_acc.clear()
         return {"cleared": target_id or "all"}
 
-    async def _perf_set_recording(self, recording):
+    async def _perf_set_recording(self, recording, label=None):
         # Any explicit state change supersedes a timer: the AI's auto-stop must
         # never fire into a take the user started afterwards.
         self._perf_cancel_stop()
@@ -1245,7 +1245,7 @@ class PerfMonitor:
             self._perf_session_elapsed = 0.0
             self._perf_session_start = time.time() * 1000
             self._perf_session_tab = await self._perf_capture_tab()
-            self._perf_session_label = ""
+            self._perf_session_label = str(label or "").strip()[:60]
             self._perf_recording = True
             await self._perf_agent_start()
             await self._perf_profile_start()
@@ -1548,6 +1548,42 @@ class PerfMonitor:
             "profile": data.get("profile") or [],
             "profile_meta": data.get("profile_meta") or {},
         }
+
+    def _perf_rename_recording(self, session_id, label):
+        """Set the label of a saved take, in the take and its sidecar.
+
+        The label lives in both places on purpose: the sidecar is what the list
+        reads (cheaply), the take itself is what review mode and the AI tool
+        read, so a rename has to reach both or the two disagree. Rewriting a
+        multi-megabyte take costs a few tens of ms, which is fine for a manual
+        action.
+        """
+        name = os.path.basename(str(session_id or "").strip())
+        if not name:
+            raise RuntimeError("No recording id given.")
+        if not name.endswith(".json"):
+            name += ".json"
+        folder = self._perf_recordings_dir()
+        path = os.path.join(folder, name)
+        if not os.path.exists(path):
+            raise RuntimeError(f"No recording '{session_id}'.")
+        label = str(label or "").strip()[:60]
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["label"] = label
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+
+        meta_path = os.path.join(folder, name[:-5] + ".meta.json")
+        try:
+            with open(meta_path, encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except Exception:
+            meta = {"id": data.get("id") or name[:-5]}
+        meta["label"] = label
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False)
+        return {"id": meta.get("id") or name[:-5], "label": label}
 
     def _perf_delete_recording(self, session_id):
         name = os.path.basename(str(session_id or "").strip())
