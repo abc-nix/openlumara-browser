@@ -487,6 +487,7 @@ class PerfMonitor:
         self._perf_stop_at = 0.0
         self._perf_last_stop = {}
         self._perf_session_tab = {}      # tab id/url/title captured at Record
+        self._perf_session_label = ""    # optional name given to a take
         self._perf_net_extra = False     # Network enabled for this take only
         self._perf_stop = asyncio.Event()
         self._perf_task = asyncio.create_task(self._perf_loop())
@@ -507,6 +508,7 @@ class PerfMonitor:
         self._perf_cancel_stop()
         self._perf_last_stop = {}
         self._perf_session_tab = {}
+        self._perf_session_label = ""
         self._perf_net_extra = False
         self._perf_selected_target = None
         self._perf_recording = False
@@ -1103,6 +1105,7 @@ class PerfMonitor:
             self._perf_session_elapsed = 0.0
             self._perf_session_start = time.time() * 1000
             self._perf_session_tab = await self._perf_capture_tab()
+            self._perf_session_label = ""
             self._perf_recording = True
             await self._perf_agent_start()
             await self._perf_profile_start()
@@ -1216,6 +1219,7 @@ class PerfMonitor:
             "tab": target,
             "tab_url": tab_url,
             "tab_title": tab_info.get("title") or "",
+            "label": self._perf_session_label or "",
             "session_seconds": self._perf_session_seconds(),
             "session_start_ms": int(self._perf_session_start) if self._perf_session_start > 0 else 0,
             "sample_interval_ms": int(self._perf_rec_interval * 1000),
@@ -1235,6 +1239,7 @@ class PerfMonitor:
             "tab": target,
             "tab_url": tab_url,
             "tab_title": payload["tab_title"],
+            "label": payload["label"],
             "session_seconds": payload["session_seconds"],
             "event_count": len(events),
             "samples": len(samples),
@@ -1252,18 +1257,46 @@ class PerfMonitor:
             self.log("browser", f"perf monitor: could not save the recording: {core_detail_error(e)}")
             return None
 
-    def _perf_prune_recordings(self, keep=50):
+    def _perf_remove_recording(self, folder, name):
+        for path in (os.path.join(folder, name),
+                     os.path.join(folder, name[:-5] + ".meta.json")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _perf_prune_recordings(self, keep=50, max_mb=200):
+        """Keep the newest `keep` takes and the most recent `max_mb` of them.
+
+        A take carries every event and sample, so fifty of them can reach
+        hundreds of megabytes; the size ceiling deletes the oldest first.
+        """
         try:
             folder = self._perf_recordings_dir()
-            names = sorted((n for n in os.listdir(folder) if n.endswith(".json")
-                            and not n.endswith(".meta.json")), reverse=True)
+
+            def take_names():
+                return sorted((n for n in os.listdir(folder) if n.endswith(".json")
+                               and not n.endswith(".meta.json")), reverse=True)
+
+            names = take_names()
             for name in names[max(int(keep), 1):]:
-                for path in (os.path.join(folder, name),
-                             os.path.join(folder, name[:-5] + ".meta.json")):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
+                self._perf_remove_recording(folder, name)
+
+            names = take_names()
+            budget = max(int(max_mb), 1) * 1024 * 1024
+            total = 0
+            cut = None
+            for index, name in enumerate(names):
+                try:
+                    total += os.path.getsize(os.path.join(folder, name))
+                except OSError:
+                    pass
+                if total > budget:
+                    cut = index
+                    break
+            if cut is not None:
+                for name in names[cut:]:
+                    self._perf_remove_recording(folder, name)
         except Exception:
             pass
 
@@ -1309,6 +1342,7 @@ class PerfMonitor:
         long_session = sum(1 for e in events if e.get("kind") == "longtask")
         return {
             "recording_id": data.get("id"),
+            "label": data.get("label") or "",
             "started_at": data.get("started_at"),
             "started_at_local": data.get("started_at_local"),
             "saved_at": data.get("saved_at"),
@@ -1347,6 +1381,7 @@ class PerfMonitor:
         samples = data.get("samples") or []
         return {
             "id": data.get("id"),
+            "label": data.get("label") or "",
             "started_at_local": data.get("started_at_local"),
             "saved_at_local": data.get("saved_at_local"),
             "tab_url": data.get("tab_url"),
@@ -1513,7 +1548,7 @@ class PerfMonitor:
 
     @core.module.tool
     async def browser_monitor_record(self, action: str = "start", seconds: int = 15,
-                                     restart: bool = False):
+                                     restart: bool = False, label: str = ""):
         """Start, stop or inspect a recording session.
 
         `start` returns immediately and schedules the stop on the server, so the
@@ -1527,6 +1562,8 @@ class PerfMonitor:
             seconds: how long to record, 1-120 (default 15).
             restart: start a fresh take even if one is already running; this
                 clears the current session (it is saved first).
+            label: a short name for the take, shown in the saved list and in
+                the summary (e.g. "scroll repro").
         """
         action = str(action or "start").strip().lower()
         now = time.time()
@@ -1534,6 +1571,7 @@ class PerfMonitor:
         def state():
             out = {
                 "recording": self._perf_recording,
+                "label": self._perf_session_label or "",
                 "session_seconds": self._perf_session_seconds(),
                 "event_count": len(self._perf_event_log),
                 "sample_interval_ms": int(self._perf_rec_interval * 1000),
@@ -1562,6 +1600,7 @@ class PerfMonitor:
             if restart and self._perf_recording:
                 await self._perf_set_recording(False)
             await self._perf_set_recording(True)
+            self._perf_session_label = str(label or "").strip()[:60]
             window = self._perf_schedule_stop(seconds)
             out = state()
             out.update({"seconds": window, "remaining_s": window,

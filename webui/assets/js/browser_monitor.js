@@ -202,7 +202,7 @@ const BROWSER_MONITOR = {
             this.mode = 'events';
             localStorage.setItem('bm.mode', 'events');
             this.reviewId = r.id || id;
-            this.reviewInfoText = [r.started_at_local, r.tab_title || r.tab_url,
+            this.reviewInfoText = [r.label, r.started_at_local, r.tab_title || r.tab_url,
                                    (r.session_seconds || 0) + 's'].filter(Boolean).join(' · ');
             this.recording = false;
             this.sessionSecondsValue = r.session_seconds || 0;
