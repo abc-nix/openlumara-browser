@@ -452,6 +452,9 @@ body[data-bm] .bm-cover { display: flex; }
 }
 .bm-handler-pill b { color: var(--accent, #4aa3ff); font-weight: 650; }
 .bm-muted { color: var(--text-muted, #888); font-size: 10px; }
+/* A take that hit the event log cap is missing its oldest rows: say so in a
+   warning tone instead of the neutral meta grey. */
+.bm-dropped { color: var(--warning, #d6a84a); font-size: 10px; }
 
 .bm-density {
     display: flex;

@@ -477,7 +477,13 @@ class PerfMonitor:
         self._perf_recording = False
         self._perf_session_start = 0
         self._perf_session_elapsed = 0.0
-        self._perf_event_log = deque(maxlen=max(int(self.config.get("perf_events_max", 5000) or 5000), 100))
+        self._perf_event_log = deque(maxlen=max(int(self.config.get("perf_events_max", 12000) or 12000), 100))
+        # The log is a deque, so a long take silently loses its oldest rows when
+        # the cap is reached (a 464 s take did exactly that). Count them, and
+        # remember how far the surviving events reach, so a take can say what it
+        # is missing instead of looking like it started late.
+        self._perf_events_dropped = 0
+        self._perf_events_dropped_before_ms = 0.0
         self._perf_event_seq = 0
         self._perf_handler_stats = {}
         self._perf_profile = []
@@ -984,7 +990,13 @@ class PerfMonitor:
                 # Their rows have long left the log; only the map would grow.
                 self._perf_merged.clear()
             self._perf_merged[key] = item
-        self._perf_event_log.append(item)
+        log = self._perf_event_log
+        if log.maxlen is not None and len(log) >= log.maxlen and log:
+            # appending evicts the oldest row; keep count of what the take lost
+            self._perf_events_dropped += 1
+            self._perf_events_dropped_before_ms = max(
+                self._perf_events_dropped_before_ms, _number(log[0].get("rel_ms")))
+        log.append(item)
 
     def _perf_merge_handler(self, row):
         """Fold one drained handler aggregate into the session totals.
@@ -1192,6 +1204,7 @@ class PerfMonitor:
             "recording": self._perf_recording,
             "session_seconds": self._perf_session_seconds(),
             "event_count": len(self._perf_event_log),
+            "events_dropped": self._perf_events_dropped,
         }
 
     async def _perf_clear(self, target_id=None):
@@ -1219,6 +1232,8 @@ class PerfMonitor:
         if recording:
             self._perf_event_log.clear()
             self._perf_event_seq = 0
+            self._perf_events_dropped = 0
+            self._perf_events_dropped_before_ms = 0.0
             self._perf_handler_stats = {}
             self._perf_merged = {}
             target = self._perf_selected_target
@@ -1277,6 +1292,8 @@ class PerfMonitor:
             "recording": self._perf_recording,
             "session_seconds": self._perf_session_seconds(),
             "event_count": len(self._perf_event_log),
+            "events_dropped": self._perf_events_dropped,
+            "events_dropped_before_ms": round(self._perf_events_dropped_before_ms, 1),
             "functions": self._perf_profile,
             "profile_active": self._perf_profile_active,
             "events": events[-max(int(limit or 300), 1):],
@@ -1295,6 +1312,9 @@ class PerfMonitor:
         self._perf_last_stop = {}
         await self._perf_network(False)
         self._perf_event_log.clear()
+        self._perf_event_seq = 0
+        self._perf_events_dropped = 0
+        self._perf_events_dropped_before_ms = 0.0
         self._perf_handler_stats = {}
         self._perf_merged = {}
         self._perf_rec_samples.clear()
@@ -1349,6 +1369,8 @@ class PerfMonitor:
             "session_start_ms": int(self._perf_session_start) if self._perf_session_start > 0 else 0,
             "sample_interval_ms": int(self._perf_rec_interval * 1000),
             "event_count": len(events),
+            "events_dropped": self._perf_events_dropped,
+            "events_dropped_before_ms": round(self._perf_events_dropped_before_ms, 1),
             "events": events,
             "samples": samples,
             "handlers": self._perf_top_handlers(50),
@@ -1369,6 +1391,7 @@ class PerfMonitor:
             "label": payload["label"],
             "session_seconds": payload["session_seconds"],
             "event_count": len(events),
+            "events_dropped": self._perf_events_dropped,
             "samples": len(samples),
             "long_frames": long_frames,
         }
@@ -1517,6 +1540,8 @@ class PerfMonitor:
             "session_start_ms": data.get("session_start_ms"),
             "sample_interval_ms": data.get("sample_interval_ms"),
             "event_count": len(events),
+            "events_dropped": data.get("events_dropped") or 0,
+            "events_dropped_before_ms": data.get("events_dropped_before_ms") or 0,
             "events": events[-400:],
             "samples": samples[-600:],
             "handlers": data.get("handlers") or [],

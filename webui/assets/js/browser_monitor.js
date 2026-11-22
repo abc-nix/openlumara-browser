@@ -43,6 +43,10 @@ const BROWSER_MONITOR = {
     sessionStartMs: 0,
     recIntervalMs: 250,
     samplesTruncated: 0,
+    // Events the take lost to the log cap (see perf.py _perf_append_event);
+    // `eventsDroppedBeforeMs` is the session time the surviving rows reach.
+    eventsDropped: 0,
+    eventsDroppedBeforeMs: 0,
     lastSessionId: '',
     recordings: [],
     reviewId: '',
@@ -186,6 +190,8 @@ const BROWSER_MONITOR = {
             this.recIntervalMs = r.sample_interval_ms || 250;
             this.sessionStartMs = r.session_start_ms || 0;
             this.samplesTruncated = r.samples_truncated || 0;
+            this.eventsDropped = r.events_dropped || 0;
+            this.eventsDroppedBeforeMs = r.events_dropped_before_ms || 0;
             this.lastSessionId = r.last_session_id || this.lastSessionId;
             this.maybeRefreshTargets(this.targetId);
         } catch (e) {
@@ -231,6 +237,8 @@ const BROWSER_MONITOR = {
             this.recIntervalMs = r.sample_interval_ms || 250;
             this.sessionStartMs = r.session_start_ms || 0;
             this.samplesTruncated = 0;
+            this.eventsDropped = r.events_dropped || 0;
+            this.eventsDroppedBeforeMs = r.events_dropped_before_ms || 0;
             this.lastSessionId = r.id || this.lastSessionId;
             this.selectedEvent = null;
             this.profileWindow = '';
@@ -350,6 +358,8 @@ const BROWSER_MONITOR = {
             this.recSamples = [];
             this.sessionStartMs = 0;
             this.samplesTruncated = 0;
+            this.eventsDropped = 0;
+            this.eventsDroppedBeforeMs = 0;
             this.lastSessionId = '';
             this.clearRange();
         } catch (e) {
@@ -792,6 +802,15 @@ const BROWSER_MONITOR = {
     fmtRel(ms) {
         const v = Number(ms) || 0;
         return v >= 1000 ? '+' + (v / 1000).toFixed(2) + 's' : '+' + v.toFixed(1) + 'ms';
+    },
+
+    // A take that hit the event log cap lost its oldest rows silently, so its
+    // timeline starts late without saying so. Show the loss next to the count.
+    droppedNote() {
+        if (!this.eventsDropped) return '';
+        const before = Number(this.eventsDroppedBeforeMs) || 0;
+        return this.eventsDropped + ' events dropped (log cap)'
+            + (before ? ', nothing before ' + (before / 1000).toFixed(1) + ' s' : '');
     },
 
     errText(e) {

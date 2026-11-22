@@ -174,6 +174,7 @@
                 </span>
                 <span class="bm-meta"><span x-text="sessionTime()"></span> · <span x-text="eventCount + ' events'"></span></span>
                 <span class="bm-meta" x-show="lastSessionId" :title="'saved to data/browser/recordings'" x-text="'saved: ' + lastSessionId"></span>
+                <span class="bm-meta bm-dropped" x-show="eventsDropped" :title="'the event log hit its cap; the oldest rows of this take are gone'" x-text="droppedNote()"></span>
                 <span class="bm-bar-spacer"></span>
                 <span class="bm-meta" x-text="'tab: ' + targetLabel()"></span>
             </div>
@@ -350,7 +351,7 @@
                     <div class="bm-detail-row"><span>target</span><code x-text="selectedEvent?.target || ''"></code></div>
                     <div class="bm-detail-row" x-show="selectedEvent?.data?.count > 1">
                         <span>folded</span>
-                        <code x-text="selectedEvent.data.count + '× in this window · ' + selectedEvent.data.ms_total + ' ms total'"></code>
+                        <code x-text="(selectedEvent?.data?.count || 0) + '× in this window · ' + (selectedEvent?.data?.ms_total || 0) + ' ms total'"></code>
                     </div>
                     <div class="bm-detail-row"><span>handler</span><code x-text="handlerName(selectedEvent)"></code></div>
                     <div class="bm-detail-row"><span>during scroll</span><code x-text="selectedEvent?.during_scroll ? 'yes' : 'no'"></code></div>
