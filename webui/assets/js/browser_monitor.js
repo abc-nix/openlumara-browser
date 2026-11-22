@@ -14,17 +14,29 @@ const BROWSER_MONITOR = {
     samples: [],
     latestSample: null,
     events: [],
+    handlers: [],
     connected: false,
     recording: false,
     eventCount: 0,
     profileFunctions: [],
     profileActive: false,
     sessionSecondsValue: 0,
+    // Session graph: recording-only samples on a finer grid than the resource
+    // history, plus the range the user drags to scope the event list.
+    recSamples: [],
+    sessionStartMs: 0,
+    recIntervalMs: 250,
+    chartMetric: 'fps',
+    hoverRel: null,
+    rangeFrom: null,
+    rangeTo: null,
+    rangeAnchor: null,
+    dragging: false,
     intervalMs: 1000,
     error: '',
     busy: false,
     filterKind: 'all',
-    filterKinds: ['all', 'scroll', 'input', 'raf', 'longtask', 'console', 'network', 'navigation', 'error'],
+    filterKinds: ['all', 'scroll', 'input', 'raf', 'longtask', 'json', 'console', 'network', 'navigation', 'error'],
     minDuration: 0,
     duringScrollOnly: false,
     eventSearch: '',
@@ -128,6 +140,10 @@ const BROWSER_MONITOR = {
             this.profileFunctions = r.functions || [];
             this.profileActive = !!r.profile_active;
             this.events = r.events || [];
+            this.handlers = r.handlers || [];
+            this.recSamples = r.samples || [];
+            this.recIntervalMs = r.sample_interval_ms || 250;
+            this.sessionStartMs = r.session_start_ms || 0;
         } catch (e) {
             this.connected = false;
             this.error = this.errText(e);
@@ -150,6 +166,7 @@ const BROWSER_MONITOR = {
             this.recording = !!r.recording;
             this.eventCount = r.event_count || 0;
             this.sessionSecondsValue = r.session_seconds || 0;
+            if (this.recording) this.clearRange();
             await this.pollEvents();
         } catch (e) {
             this.error = 'could not change recording (' + this.errText(e) + ')';
@@ -178,11 +195,15 @@ const BROWSER_MONITOR = {
         try {
             await simpleApiPost('/api/ext/browser/perf/events/clear', {});
             this.events = [];
+            this.handlers = [];
             this.eventCount = 0;
             this.profileFunctions = [];
             this.profileActive = false;
             this.sessionSecondsValue = 0;
             this.selectedEvent = null;
+            this.recSamples = [];
+            this.sessionStartMs = 0;
+            this.clearRange();
         } catch (e) {
             this.error = 'could not clear events (' + this.errText(e) + ')';
         } finally {
@@ -256,8 +277,8 @@ const BROWSER_MONITOR = {
         else if (l.script_pct > 10) score -= 9;
         if (l.heap > 150 * 1048576) score -= 18;
         else if (l.heap > 90 * 1048576) score -= 7;
-        if (l.long_tasks > 20) score -= 12;
-        else if (l.long_tasks > 8) score -= 5;
+        if (l.long_tasks_total > 20) score -= 12;
+        else if (l.long_tasks_total > 8) score -= 5;
         if (l.nodes > 4000) score -= 10;
         return Math.max(0, Math.min(100, Math.round(score)));
     },
@@ -283,7 +304,7 @@ const BROWSER_MONITOR = {
         else if (key === 'task_pct') { bad = l.task_pct > 28; warn = l.task_pct > 14; }
         else if (key === 'layout_per_s') { bad = l.layout_per_s > 20; warn = l.layout_per_s > 10; }
         else if (key === 'style_per_s') { bad = l.style_per_s > 20; warn = l.style_per_s > 10; }
-        else if (key === 'long_tasks') { bad = l.long_tasks > 20; warn = l.long_tasks > 8; }
+        else if (key === 'long_tasks') { bad = (l.long_tasks_total || 0) > 20; warn = (l.long_tasks_total || 0) > 8; }
         else if (key === 'listeners') { bad = l.listeners > 220; warn = l.listeners > 150; }
         return bad ? 'bad' : warn ? 'warn' : 'good';
     },
@@ -351,16 +372,11 @@ const BROWSER_MONITOR = {
             .reduce((sum, e) => sum + (Number(e.duration) || 0), 0));
     },
 
+    // Listener calls are counted in the page (perf.py `M.note`) and folded into
+    // session totals server-side, so the panel reads those rows instead of
+    // rebuilding them from events that no longer contain one per call.
     topHandlers() {
-        const byName = new Map();
-        for (const e of this.events) {
-            if (!e.handler || e.handler.name === '—') continue;
-            const row = byName.get(e.handler.name) || { name: e.handler.name, count: 0, ms: 0 };
-            row.count += 1;
-            row.ms += Number(e.duration) || 0;
-            byName.set(e.handler.name, row);
-        }
-        return [...byName.values()].sort((a, b) => b.ms - a.ms).slice(0, 3);
+        return (this.handlers || []).slice(0, 3);
     },
 
     density() {
@@ -377,6 +393,174 @@ const BROWSER_MONITOR = {
         return buckets.map((v) => Math.max(4, Math.round((v / max) * 100)));
     },
 
+    // ---- session graph -------------------------------------------------
+    // The recording series is on its own fast grid (perf_rec_interval_ms), and
+    // both the line and the long-frame markers are plotted against the session
+    // clock (seconds since Record), so a spike lines up with the events that
+    // could have caused it.
+    graphMetrics() {
+        return [
+            { key: 'fps', label: 'FPS', unit: 'fps' },
+            { key: 'gap_max_ms', label: 'Frame gap', unit: 'ms' },
+            { key: 'frames_lost', label: 'Frames lost', unit: '' },
+            { key: 'task_pct', label: 'Main thread', unit: '%' },
+            { key: 'script_pct', label: 'Script', unit: '%' },
+            { key: 'style_per_s', label: 'Style /s', unit: '/s' },
+            { key: 'layout_per_s', label: 'Layout /s', unit: '/s' },
+            { key: 'style_ms', label: 'Style cost', unit: 'ms' },
+            { key: 'layout_ms', label: 'Layout cost', unit: 'ms' },
+            { key: 'long_tasks', label: 'Long tasks', unit: '' },
+            { key: 'heap', label: 'JS heap', unit: 'bytes' },
+            { key: 'nodes', label: 'DOM nodes', unit: '' },
+        ];
+    },
+
+    metricInfo() {
+        return this.graphMetrics().find((m) => m.key === this.chartMetric) || this.graphMetrics()[0];
+    },
+
+    setMetric(key) {
+        this.chartMetric = key;
+    },
+
+    metricValue(sample) {
+        return Number(sample && sample[this.chartMetric]) || 0;
+    },
+
+    graphPoints() {
+        if (!this.sessionStartMs || !this.recSamples.length) return [];
+        return this.recSamples.map((s) => ({
+            rel: Math.max(0, (Number(s.t) * 1000 - this.sessionStartMs) / 1000),
+            value: this.metricValue(s),
+        }));
+    },
+
+    graphDomain() {
+        const pts = this.graphPoints();
+        const last = pts.length ? pts[pts.length - 1].rel : 0;
+        return Math.max(1, this.sessionSeconds(), last);
+    },
+
+    graphPeak() {
+        const peak = this.graphPoints().reduce((m, p) => Math.max(m, p.value), 0);
+        return peak > 0 ? peak * 1.06 : 1;
+    },
+
+    graphY(value, h = 160) {
+        return Math.round(h - 4 - (value / this.graphPeak()) * (h - 12));
+    },
+
+    graphX(rel, w = 620) {
+        return Math.round((Number(rel) / this.graphDomain()) * w);
+    },
+
+    graphLine() {
+        return this.graphPoints().map((p) => `${this.graphX(p.rel)},${this.graphY(p.value)}`).join(' ');
+    },
+
+    graphArea() {
+        const line = this.graphLine();
+        return line ? `0,160 ${line} 620,160` : '';
+    },
+
+    graphMarkers() {
+        const domain = this.graphDomain();
+        return this.events
+            .filter((e) => e.kind === 'longtask')
+            .map((e) => ({
+                rel: Number(e.rel_ms) / 1000,
+                pct: Math.min(100, (Number(e.rel_ms) / 1000 / domain) * 100),
+                label: `${(Number(e.duration) || 0).toFixed(0)} ms at ${this.fmtRel(e.rel_ms)}`,
+            }));
+    },
+
+    graphSelection() {
+        if (this.rangeFrom === null || this.rangeTo === null) return null;
+        const domain = this.graphDomain();
+        const a = Math.min(this.rangeFrom, this.rangeTo);
+        const b = Math.max(this.rangeFrom, this.rangeTo);
+        return { left: (a / domain) * 100, width: Math.max(0.4, ((b - a) / domain) * 100), from: a, to: b };
+    },
+
+    graphRelFromEvent(ev) {
+        const el = ev.currentTarget || ev.target;
+        const rect = el.getBoundingClientRect();
+        const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / Math.max(1, rect.width)));
+        return frac * this.graphDomain();
+    },
+
+    hoverGraph(ev) {
+        this.hoverRel = this.graphRelFromEvent(ev);
+        if (this.dragging && this.rangeAnchor !== null) this.rangeTo = this.hoverRel;
+    },
+
+    hoverOut() {
+        if (!this.dragging) this.hoverRel = null;
+    },
+
+    beginRange(ev) {
+        this.dragging = true;
+        this.hoverRel = this.graphRelFromEvent(ev);
+        this.rangeAnchor = this.hoverRel;
+        this.rangeFrom = this.rangeAnchor;
+        this.rangeTo = this.rangeAnchor;
+    },
+
+    endRange(ev) {
+        if (!this.dragging) return;
+        this.dragging = false;
+        if (ev && ev.currentTarget && ev.currentTarget.getBoundingClientRect) {
+            this.hoverRel = this.graphRelFromEvent(ev);
+            this.rangeTo = this.hoverRel;
+        }
+        const a = Math.min(this.rangeFrom, this.rangeTo);
+        const b = Math.max(this.rangeFrom, this.rangeTo);
+        if (b - a < 0.15) {
+            this.clearRange();
+        } else {
+            this.rangeFrom = a;
+            this.rangeTo = b;
+        }
+        this.rangeAnchor = null;
+    },
+
+    clearRange() {
+        this.rangeFrom = null;
+        this.rangeTo = null;
+        this.rangeAnchor = null;
+        this.dragging = false;
+    },
+
+    rangeLabel() {
+        const sel = this.graphSelection();
+        if (!sel) return '';
+        return `${sel.from.toFixed(2)}–${sel.to.toFixed(2)} s · ${this.filteredEvents().length} events`;
+    },
+
+    hoverSampleInfo() {
+        if (this.hoverRel === null || !this.recSamples.length) return null;
+        let best = null;
+        for (const p of this.graphPoints()) {
+            if (!best || Math.abs(p.rel - this.hoverRel) < Math.abs(best.rel - this.hoverRel)) best = p;
+        }
+        if (!best) return null;
+        return { rel: best.rel, value: best.value, left: (best.rel / this.graphDomain()) * 100 };
+    },
+
+    fmtMetric(value) {
+        const m = this.metricInfo();
+        const v = Math.round(Number(value) * 10) / 10;
+        if (m.unit === 'bytes') return this.fmtMB(value);
+        if (m.unit === '%') return v + '%';
+        if (m.unit === 'ms') return v + ' ms';
+        return m.unit ? v + ' ' + m.unit : String(v);
+    },
+
+    axisLabel(seconds) {
+        const s = Number(seconds) || 0;
+        return s >= 60 ? `${(s / 60).toFixed(1)}m` : `${s.toFixed(1)}s`;
+    },
+
     setFilter(kind) {
         this.filterKind = kind;
     },
@@ -384,8 +568,8 @@ const BROWSER_MONITOR = {
     filterLabel(kind) {
         return {
             all: 'All', scroll: 'Scroll', input: 'Input', raf: 'RAF',
-            longtask: 'Long tasks', console: 'Console', network: 'Network',
-            navigation: 'Nav', error: 'Errors',
+            longtask: 'Long tasks', json: 'JSON parse', console: 'Console',
+            network: 'Network', navigation: 'Nav', error: 'Errors',
         }[kind] || kind;
     },
 
@@ -396,16 +580,20 @@ const BROWSER_MONITOR = {
     filteredEvents() {
         const term = String(this.eventSearch || '').trim().toLowerCase();
         const min = Number(this.minDuration || 0);
+        const sel = this.graphSelection();
+        const lo = sel ? sel.from * 1000 : null;
+        const hi = sel ? sel.to * 1000 : null;
         return this.events.filter((e) => {
             if (this.filterKind !== 'all' && e.kind !== this.filterKind) return false;
             if ((Number(e.duration) || 0) < min) return false;
+            if (lo !== null && ((Number(e.rel_ms) || 0) < lo || (Number(e.rel_ms) || 0) > hi)) return false;
             if (this.duringScrollOnly && !e.during_scroll) return false;
             if (term) {
                 const hay = `${e.kind} ${e.name} ${e.target} ${e.handler?.name || ''}`.toLowerCase();
                 if (!hay.includes(term)) return false;
             }
             return true;
-        });
+        }).sort((a, b) => (Number(a.rel_ms) || 0) - (Number(b.rel_ms) || 0));
     },
 
     selectEvent(event) {

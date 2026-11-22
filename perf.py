@@ -71,6 +71,23 @@ AGENT_JS = r"""
                            stack: stack, site: site},
                  data: {}, during_scroll: now - this.scrollAt < 200}, now);
     },
+    // A json() call that blocks is invisible in a CPU profile (parsing is
+    // native) yet shows up in LoAF as work on the awaiting script. Recording it
+    // names the endpoint, the payload size and the calling stack, which is what
+    // turns "45 ms in Response.json.then" into a line of code.
+    jsonNote(url, status, bytes, count, dur, stack, at) {
+      if (!this.enabled) return;
+      this.push({
+        kind: 'json',
+        name: url || 'response',
+        duration: dur,
+        target: status ? 'HTTP ' + status : 'response',
+        handler: {name: 'json parse', source: '', stack: stack || [],
+                  site: stack ? stack.slice(0, 2) : null},
+        data: {bytes: bytes, count: count, status: status},
+        severity: dur >= 16 ? 'warn' : 'info',
+      }, at);
+    },
     // A long task has no render phases; a long animation frame does. Splitting
     // it into work / render / style+layout is what says whether a frame was JS
     // or rendering - renderStart and styleAndLayoutStart exist only on LoAF.
@@ -215,10 +232,60 @@ AGENT_JS = r"""
         }
       });
     };
+    // Native JSON parsing blocks the main thread but never shows up in a CPU
+    // profile, and LoAF only names "the awaiting script". Timing json() and
+    // keeping the fetch call stack turns that into an endpoint, a payload size
+    // and the function that asked for it.
+    const origFetch = window.fetch;
+    const origJson = Response.prototype.json;
+    if (origFetch && origJson) {
+      window.fetch = function(input, init) {
+        let stack = null;
+        if (M.enabled) {
+          try { stack = String(new Error().stack).split('\n').slice(2, 6).map((s) => s.trim()); }
+          catch (e) {}
+        }
+        const p = origFetch.apply(this, arguments);
+        if (!stack) return p;
+        return p.then((res) => {
+          try { res.__olCaller = stack; } catch (e) {}
+          return res;
+        });
+      };
+      const origin = String((typeof location !== 'undefined' && location.origin) || '');
+      Response.prototype.json = function() {
+        const started = performance.now();
+        const response = this;
+        const p = origJson.apply(this, arguments);
+        if (!M.enabled) return p;
+        return p.then((data) => {
+          try {
+            const url = String((response && response.url) || '').replace(origin, '');
+            // The monitor polls its own extension API every second; those
+            // responses are ours and would only add noise.
+            if (!url.includes('/api/ext/browser/perf/')) {
+              let bytes = null;
+              try { bytes = Number(response.headers.get('content-length')) || null; } catch (e) {}
+              // The API wraps its payload: {success, data:{turns:…}}.
+              const body = data && typeof data === 'object' && data.data !== undefined ? data.data : data;
+              const count = body && Array.isArray(body.turns) ? body.turns.length
+                : (Array.isArray(body) ? body.length : null);
+              M.jsonNote(url, response && response.status, bytes, count,
+                         performance.now() - started, response.__olCaller || null, started);
+            }
+          } catch (e) {}
+          return data;
+        });
+      };
+    }
     M.restore = () => {
       EventTarget.prototype.addEventListener = origAdd;
       EventTarget.prototype.removeEventListener = origRemove;
       window.requestAnimationFrame = origRaf;
+      if (origFetch && origJson) {
+        window.fetch = origFetch;
+        Response.prototype.json = origJson;
+      }
     };
   }
   return "installed";
@@ -265,29 +332,46 @@ def _agent_arm_js(elapsed_ms):
 
 PROBE_JS = r"""
 (() => {
+  const now = performance.now();
   if (!window.__olPerf) {
-    const s = {frames: 0, fps: 0, last: performance.now(), long: 0, longest: 0};
+    const s = {frames: 0, gapMax: 0, lastCb: now, long: 0, longTotal: 0,
+               longest: 0, lastRead: now};
     window.__olPerf = s;
     try {
       new PerformanceObserver((list) => {
         for (const e of list.getEntries()) {
           s.long += 1;
+          s.longTotal += 1;
           s.longest = Math.max(s.longest, e.duration || 0);
         }
       }).observe({entryTypes: ['longtask']});
     } catch (e) {}
     const tick = (t) => {
       s.frames += 1;
-      if (t - s.last >= 1000) {
-        s.fps = Math.round(s.frames * 1000 / (t - s.last));
-        s.frames = 0; s.last = t;
-      }
+      const gap = t - s.lastCb;
+      if (gap > s.gapMax) s.gapMax = gap;
+      s.lastCb = t;
       requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
   }
-  return JSON.stringify({fps: window.__olPerf.fps, long: window.__olPerf.long,
-                         longest: Math.round(window.__olPerf.longest)});
+  // Read and reset: the counters describe the window since the previous read,
+  // so a 250 ms bucket can show a single 88 ms frame instead of an average.
+  const st = window.__olPerf;
+  const window_ms = now - st.lastRead;
+  const out = {
+    window_ms: Math.round(window_ms * 10) / 10,
+    frames: st.frames,
+    gap_max_ms: Math.round(st.gapMax * 10) / 10,
+    long: st.long,
+    long_total: st.longTotal,
+    longest: Math.round(st.longest),
+  };
+  st.frames = 0;
+  st.gapMax = 0;
+  st.long = 0;
+  st.lastRead = now;
+  return JSON.stringify(out);
 })()
 """
 
@@ -313,6 +397,13 @@ def _rate(prev, cur, key, dt):
 
 def build_sample(prev, cur, dt, probe=None):
     probe = probe or {}
+    window_ms = _number(probe.get("window_ms"))
+    frames = _number(probe.get("frames"))
+    fps = round(frames * 1000.0 / window_ms) if window_ms > 0 else 0
+    # How many frames a steady 60 Hz display would have delivered in the window:
+    # the difference is what the user feels as jitter. `gap_max_ms` is the sharp
+    # one - a single 88 ms hitch shows up in exactly one bucket.
+    expected = window_ms / 16.7 if window_ms > 0 else 0.0
     return {
         "t": round(time.time(), 3),
         "heap": int(_number(cur.get("JSHeapUsedSize"))),
@@ -323,11 +414,18 @@ def build_sample(prev, cur, dt, probe=None):
         "listeners": int(_number(cur.get("JSEventListeners"))),
         "layout_per_s": round(_rate(prev, cur, "LayoutCount", dt), 2),
         "style_per_s": round(_rate(prev, cur, "RecalcStyleCount", dt), 2),
+        # Time actually spent, not just how often: a count of recalcs says
+        # nothing about cost, these are main-thread ms per second.
+        "layout_ms": round(1000 * _rate(prev, cur, "LayoutDuration", dt), 1),
+        "style_ms": round(1000 * _rate(prev, cur, "RecalcStyleDuration", dt), 1),
         "script_pct": round(100 * _rate(prev, cur, "ScriptDuration", dt), 2),
         "task_pct": round(100 * _rate(prev, cur, "TaskDuration", dt), 2),
         "task_other_pct": round(100 * _rate(prev, cur, "TaskOtherDuration", dt), 2),
-        "fps": int(_number(probe.get("fps"))),
+        "fps": int(max(0, min(fps, 240))),
+        "gap_max_ms": round(_number(probe.get("gap_max_ms")), 1),
+        "frames_lost": int(max(0, round(expected - frames))),
         "long_tasks": int(_number(probe.get("long"))),
+        "long_tasks_total": int(_number(probe.get("long_total"))),
         "longest_task": int(_number(probe.get("longest"))),
     }
 
@@ -354,6 +452,15 @@ class PerfMonitor:
         self._perf_last_metrics = {}
         self._perf_history = max(int(self.config.get("perf_history", 300) or 300), 30)
         self._perf_interval = max(int(self.config.get("perf_interval_ms", 1000) or 1000), 250) / 1000.0
+        # Recording samples on their own cadence and their own series: the fine
+        # grid is what lets the graph put a spike in one bucket, and keeping it
+        # separate stops a 250 ms recording from shrinking the 5-minute
+        # resource history to 75 seconds.
+        self._perf_rec_interval = max(int(self.config.get("perf_rec_interval_ms", 250) or 250), 100) / 1000.0
+        self._perf_rec_history = max(int(self.config.get("perf_rec_history", 4000) or 4000), 100)
+        self._perf_rec_samples = {}
+        self._perf_rec_last = {}
+        self._perf_probe_acc = {}
         self._perf_recording = False
         self._perf_session_start = 0
         self._perf_session_elapsed = 0.0
@@ -384,6 +491,9 @@ class PerfMonitor:
         self._perf_recording = False
         self._perf_session_elapsed = 0.0
         self._perf_handler_stats = {}
+        self._perf_rec_samples = {}
+        self._perf_rec_last = {}
+        self._perf_probe_acc = {}
         self._perf_profile = []
         self._perf_profile_meta = {}
         self._perf_profile_active = False
@@ -404,8 +514,9 @@ class PerfMonitor:
                 raise
             except Exception as e:
                 self.log("browser", f"perf monitor: {core_detail_error(e)}")
+            interval = self._perf_rec_interval if self._perf_recording else self._perf_interval
             try:
-                await asyncio.wait_for(self._perf_stop.wait(), timeout=self._perf_interval)
+                await asyncio.wait_for(self._perf_stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 pass
 
@@ -435,17 +546,47 @@ class PerfMonitor:
             except Exception:
                 probe = None
         now = time.monotonic()
-        prev = self._perf_last_metrics.get(target)
-        if prev is not None:
-            dt = now - prev[0]
-            if dt > 0:
-                sample = build_sample(prev[1], cur, dt, probe)
-                bucket = self._perf_samples.get(target)
+        # Recording series: one sample per fast tick, so a spike lands in its own
+        # bucket instead of being averaged away inside a one-second one.
+        if self._perf_recording:
+            prev_rec = self._perf_rec_last.get(target)
+            if prev_rec is not None and now > prev_rec[0]:
+                bucket = self._perf_rec_samples.get(target)
                 if bucket is None:
-                    bucket = deque(maxlen=self._perf_history)
-                    self._perf_samples[target] = bucket
-                bucket.append(sample)
-        self._perf_last_metrics[target] = (now, cur)
+                    bucket = deque(maxlen=self._perf_rec_history)
+                    self._perf_rec_samples[target] = bucket
+                bucket.append(build_sample(prev_rec[1], cur, now - prev_rec[0], probe))
+            self._perf_rec_last[target] = (now, cur)
+        # The probe is read once per tick and reset, so its counters describe the
+        # window since the previous read. Ticks that feed the always-on series
+        # are spaced wider, so their probe figures are accumulated here to keep
+        # that series honest at its own cadence.
+        acc = self._perf_probe_acc.get(target)
+        if probe:
+            if acc is None:
+                acc = self._perf_probe_acc[target] = {
+                    "window_ms": 0.0, "frames": 0, "gap_max_ms": 0.0,
+                    "long": 0, "long_total": 0, "longest": 0,
+                }
+            acc["window_ms"] += _number(probe.get("window_ms"))
+            acc["frames"] += int(_number(probe.get("frames")))
+            acc["gap_max_ms"] = max(acc["gap_max_ms"], _number(probe.get("gap_max_ms")))
+            acc["long"] += int(_number(probe.get("long")))
+            acc["long_total"] = int(_number(probe.get("long_total")))
+            acc["longest"] = max(acc["longest"], _number(probe.get("longest")))
+        prev = self._perf_last_metrics.get(target)
+        if prev is None:
+            self._perf_last_metrics[target] = (now, cur)
+        elif now - prev[0] >= self._perf_interval * 0.9:
+            bucket = self._perf_samples.get(target)
+            if bucket is None:
+                bucket = deque(maxlen=self._perf_history)
+                self._perf_samples[target] = bucket
+            bucket.append(build_sample(prev[1], cur, now - prev[0], acc))
+            self._perf_last_metrics[target] = (now, cur)
+            if acc is not None:
+                acc.update({"window_ms": 0.0, "frames": 0, "gap_max_ms": 0.0,
+                            "long": 0, "longest": 0})
 
     async def _perf_agent_start(self):
         target = self._perf_selected_target
@@ -778,6 +919,8 @@ class PerfMonitor:
         await self._attach_target(target_id)
         self._perf_selected_target = target_id
         self._perf_last_metrics.pop(target_id, None)
+        self._perf_rec_last.pop(target_id, None)
+        self._perf_probe_acc.pop(target_id, None)
         self._perf_samples[target_id] = deque(maxlen=self._perf_history)
         if self._perf_recording:
             await self._perf_profile_stop()
@@ -815,9 +958,15 @@ class PerfMonitor:
         if target_id:
             self._perf_samples.pop(target_id, None)
             self._perf_last_metrics.pop(target_id, None)
+            self._perf_rec_samples.pop(target_id, None)
+            self._perf_rec_last.pop(target_id, None)
+            self._perf_probe_acc.pop(target_id, None)
         else:
             self._perf_samples.clear()
             self._perf_last_metrics.clear()
+            self._perf_rec_samples.clear()
+            self._perf_rec_last.clear()
+            self._perf_probe_acc.clear()
         return {"cleared": target_id or "all"}
 
     async def _perf_set_recording(self, recording):
@@ -825,6 +974,10 @@ class PerfMonitor:
             self._perf_event_log.clear()
             self._perf_event_seq = 0
             self._perf_handler_stats = {}
+            target = self._perf_selected_target
+            self._perf_rec_samples.pop(target, None)
+            self._perf_rec_last.pop(target, None)
+            self._perf_probe_acc.pop(target, None)
             self._perf_profile = []
             self._perf_profile_meta = {}
             self._perf_session_elapsed = 0.0
@@ -857,6 +1010,9 @@ class PerfMonitor:
         events = list(self._perf_event_log)
         if target_id:
             events = [e for e in events if e.get("tab") == target_id]
+        target = target_id or self._perf_selected_target
+        rec = list(self._perf_rec_samples.get(target, ()))
+        cap = 600
         return {
             "connected": self._is_connected(),
             "recording": self._perf_recording,
@@ -865,11 +1021,21 @@ class PerfMonitor:
             "functions": self._perf_profile,
             "profile_active": self._perf_profile_active,
             "events": events[-max(int(limit or 300), 1):],
+            "handlers": self._perf_top_handlers(20),
+            # The recording graph is plotted against session_start_ms, which is
+            # the same wall clock the samples carry in `t`.
+            "samples": rec[-cap:],
+            "samples_truncated": max(0, len(rec) - cap),
+            "sample_interval_ms": int(self._perf_rec_interval * 1000),
+            "session_start_ms": int(self._perf_session_start) if self._perf_session_start > 0 else 0,
         }
 
     async def _perf_clear_events(self):
         self._perf_event_log.clear()
         self._perf_handler_stats = {}
+        self._perf_rec_samples.clear()
+        self._perf_rec_last.clear()
+        self._perf_probe_acc.clear()
         self._perf_profile = []
         self._perf_profile_meta = {}
         self._perf_session_start = 0

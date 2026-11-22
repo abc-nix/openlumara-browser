@@ -659,3 +659,126 @@ body[data-bm] .bm-cover { display: flex; }
 .bm-fn-name { color: var(--accent, #4aa3ff); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bm-fn-source { color: var(--text-muted, #888); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bm-fn-self, .bm-fn-total, .bm-fn-calls { color: var(--text-secondary, #bbb); font-variant-numeric: tabular-nums; text-align: right; }
+
+/* ==========================================================================
+   Session graph — recording-scoped samples, hover cursor, range selection
+   ========================================================================== */
+
+.bm-graph {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px;
+    border: 1px solid var(--border, #333);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.02);
+    flex-shrink: 0;
+}
+.bm-graph-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.bm-graph-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted, #888);
+}
+.bm-metric-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.bm-metric-chip {
+    padding: 3px 8px;
+    border: 1px solid var(--border, #333);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-secondary, #bbb);
+    font-size: 10.5px;
+    line-height: 1.35;
+    cursor: pointer;
+}
+.bm-metric-chip:hover { border-color: var(--accent, #4aa3ff); color: var(--text-primary, #ddd); }
+.bm-metric-chip.on {
+    border-color: var(--accent, #4aa3ff);
+    color: var(--accent, #4aa3ff);
+    background: rgba(74, 163, 255, 0.12);
+}
+.bm-graph-plot {
+    position: relative;
+    height: 160px;
+    cursor: crosshair;
+    user-select: none;
+    background:
+        linear-gradient(to right, rgba(255, 255, 255, 0.035) 1px, transparent 1px) 0 0 / 20% 100%,
+        linear-gradient(to top, rgba(255, 255, 255, 0.035) 1px, transparent 1px) 0 0 / 100% 33.33%,
+        rgba(0, 0, 0, 0.12);
+}
+.bm-graph-plot .bm-plot { width: 100%; height: 160px; }
+.bm-graph-y {
+    position: absolute;
+    inset: 0 auto 0 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 2px 4px;
+    pointer-events: none;
+    color: var(--text-muted, #888);
+    font-size: 9px;
+    font-variant-numeric: tabular-nums;
+}
+.bm-graph-band {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: rgba(74, 163, 255, 0.14);
+    border-left: 1px solid rgba(74, 163, 255, 0.55);
+    border-right: 1px solid rgba(74, 163, 255, 0.55);
+    pointer-events: none;
+}
+.bm-graph-tick {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: rgba(230, 126, 34, 0.7);
+    pointer-events: auto;
+}
+.bm-graph-cursor {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: rgba(255, 255, 255, 0.35);
+    pointer-events: none;
+}
+.bm-graph-bubble {
+    position: absolute;
+    top: 2px;
+    transform: translateX(-50%);
+    padding: 2px 6px;
+    border: 1px solid var(--border, #333);
+    border-radius: 4px;
+    background: rgba(20, 20, 20, 0.92);
+    color: var(--text-primary, #ddd);
+    font-size: 10px;
+    white-space: nowrap;
+    pointer-events: none;
+    font-variant-numeric: tabular-nums;
+}
+.bm-graph-empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted, #888);
+    font-size: 11px;
+}
+.bm-graph-axis {
+    display: flex;
+    justify-content: space-between;
+    color: var(--text-muted, #888);
+    font-size: 9px;
+    font-variant-numeric: tabular-nums;
+}
+.bm-graph-foot {
+    display: flex;
+    justify-content: space-between;
+    color: var(--text-muted, #888);
+    font-size: 10px;
+}

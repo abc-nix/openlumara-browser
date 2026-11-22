@@ -192,10 +192,64 @@
                     <span>Top handlers</span>
                     <div class="bm-handler-list">
                         <template x-for="h in topHandlers()">
-                            <span class="bm-handler-pill" :key="h.name"><span x-text="h.name"></span><b x-text="h.count"></b></span>
+                            <span class="bm-handler-pill" :key="h.type + h.name" :title="h.ms + ' ms total · ' + h.max_ms + ' ms max · ' + h.type">
+                                <span x-text="h.name"></span><b x-text="h.calls"></b>
+                            </span>
                         </template>
                         <span class="bm-muted" x-show="!topHandlers().length">no handler calls yet</span>
                     </div>
+                </div>
+            </div>
+
+            <div class="bm-graph">
+                <div class="bm-graph-head">
+                    <span class="bm-graph-title">Session graph</span>
+                    <div class="bm-metric-chips">
+                        <template x-for="m in graphMetrics()">
+                            <button type="button" :key="m.key" class="bm-metric-chip"
+                                    :class="{ on: chartMetric === m.key }" @click="setMetric(m.key)"
+                                    x-text="m.label"></button>
+                        </template>
+                    </div>
+                    <span class="bm-bar-spacer"></span>
+                    <span class="bm-meta" x-text="rangeLabel() || (recIntervalMs + ' ms grid · ' + recSamples.length + ' samples')"></span>
+                    <button type="button" class="bm-btn" x-show="graphSelection()" @click="clearRange()">Clear range</button>
+                </div>
+                <div class="bm-graph-plot" @mousemove="hoverGraph($event)" @mouseleave="hoverOut()"
+                     @mousedown.prevent="beginRange($event)" @mouseup="endRange($event)"
+                     @mouseup.window="endRange($event)">
+                    <svg class="bm-plot" viewBox="0 0 620 160" preserveAspectRatio="none" aria-hidden="true">
+                        <polygon :points="graphArea()" class="bm-area"></polygon>
+                        <polyline :points="graphLine()" class="bm-line"></polyline>
+                    </svg>
+                    <div class="bm-graph-y">
+                        <span x-text="fmtMetric(graphPeak())"></span>
+                        <span x-text="fmtMetric(graphPeak() / 2)"></span>
+                        <span>0</span>
+                    </div>
+                    <div class="bm-graph-band" x-show="graphSelection()"
+                         :style="graphSelection() ? 'left:' + graphSelection().left + '%;width:' + graphSelection().width + '%' : ''"></div>
+                    <template x-for="mk in graphMarkers()">
+                        <span :key="mk.rel + mk.label" class="bm-graph-tick" :style="'left:' + mk.pct + '%'"
+                              :title="mk.label"></span>
+                    </template>
+                    <div class="bm-graph-cursor" x-show="hoverSampleInfo()"
+                         :style="hoverSampleInfo() ? 'left:' + hoverSampleInfo().left + '%' : ''"></div>
+                    <div class="bm-graph-bubble" x-show="hoverSampleInfo()"
+                         :style="hoverSampleInfo() ? 'left:' + hoverSampleInfo().left + '%' : ''"
+                         x-text="hoverSampleInfo() ? fmtMetric(hoverSampleInfo().value) + ' · ' + hoverSampleInfo().rel.toFixed(2) + ' s' : ''"></div>
+                    <div class="bm-graph-empty" x-show="!recSamples.length">
+                        Press Record to collect samples for the session graph.
+                    </div>
+                </div>
+                <div class="bm-graph-axis">
+                    <span>0s</span>
+                    <span x-text="axisLabel(graphDomain() / 2)"></span>
+                    <span x-text="axisLabel(graphDomain())"></span>
+                </div>
+                <div class="bm-graph-foot">
+                    <span x-text="metricInfo().label + (metricInfo().unit ? ' (' + metricInfo().unit + ')' : '')"></span>
+                    <span>drag to scope events · tick = long frame</span>
                 </div>
             </div>
 
@@ -287,6 +341,10 @@
                     <div class="bm-detail-row"><span>target</span><code x-text="selectedEvent?.target || ''"></code></div>
                     <div class="bm-detail-row"><span>handler</span><code x-text="handlerName(selectedEvent)"></code></div>
                     <div class="bm-detail-row"><span>during scroll</span><code x-text="selectedEvent?.during_scroll ? 'yes' : 'no'"></code></div>
+                    <div class="bm-detail-row" x-show="selectedEvent?.data?.bytes != null">
+                        <span>payload</span>
+                        <code x-text="(selectedEvent?.data?.bytes ? Math.round(selectedEvent.data.bytes / 1024) + ' KB' : 'size unknown') + (selectedEvent?.data?.count != null ? ' · ' + selectedEvent.data.count + ' items' : '')"></code>
+                    </div>
                     <div class="bm-detail-row" x-show="selectedEvent?.data?.entryType === 'long-animation-frame'">
                         <span>work / render</span>
                         <code x-text="(selectedEvent?.data?.work_ms || 0) + ' / ' + (selectedEvent?.data?.render_ms || 0) + ' ms'"></code>
@@ -301,7 +359,7 @@
                     </div>
                     <div class="bm-detail-section">
                         <span>stack</span>
-                        <pre class="bm-detail-stack" x-text="(selectedEvent?.stack || []).join('\n')"></pre>
+                        <pre class="bm-detail-stack" x-text="(selectedEvent?.handler?.stack || []).join('\n')"></pre>
                     </div>
                     <div class="bm-detail-section" x-show="selectedEvent?.data?.scripts?.length">
                         <span>scripts in this frame</span>
