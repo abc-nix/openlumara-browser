@@ -7,6 +7,21 @@
 // The backend owns sampling and recording (webui_perf.py -> perf.py). This file
 // only polls the extension routes and keeps the two views in sync.
 
+// Session-graph geometry, one pass per sample set.
+//
+// The template asks for graphArea() and graphLine(), and graphArea() builds
+// the line itself, so a redraw walked every sample twice; worse, graphY()
+// asked for graphPeak() per point and graphPeak() reduced over all of them,
+// i.e. O(n^2) reads for one polyline (a 464 s take is ~1860 samples, ~7 M).
+// The geometry is therefore computed once per sample set and cached.
+//
+// The cache lives at module scope on purpose: on the store it would be wrapped
+// by @vue/reactivity and every point read would go through a proxy trap, which
+// is the cost being removed. It is keyed on exactly what the picture depends
+// on, so a new sample, a metric switch, a cleared session, an opened take and
+// the ticking session clock each invalidate it.
+const GRAPH_GEOM = { key: '', points: [], domain: 1, peak: 1, line: '', area: '' };
+
 const BROWSER_MONITOR = {
     mode: localStorage.getItem('bm.mode') || 'resources',
     targetId: localStorage.getItem('bm.target') || '',
@@ -559,44 +574,67 @@ const BROWSER_MONITOR = {
         this.chartMetric = key;
     },
 
-    metricValue(sample) {
-        return Number(sample && sample[this.chartMetric]) || 0;
+    // One pass over the samples per redraw, then cache hits (see GRAPH_GEOM).
+    graphGeometry() {
+        const n = this.recSamples.length;
+        const seconds = this.sessionSeconds();
+        const last = n ? Number(this.recSamples[n - 1].t) : 0;
+        const key = `${this.sessionStartMs}|${this.chartMetric}|${n}|${last}|${seconds}`;
+        if (GRAPH_GEOM.key === key) return GRAPH_GEOM;
+
+        const W = 620;
+        const H = 160;
+        const points = [];
+        let peak = 0;
+        let maxRel = 0;
+        if (this.sessionStartMs && n) {
+            for (let i = 0; i < n; i++) {
+                const s = this.recSamples[i];
+                const rel = Math.max(0, (Number(s.t) * 1000 - this.sessionStartMs) / 1000);
+                const value = Number(s[this.chartMetric]) || 0;
+                points.push({ rel, value });
+                if (value > peak) peak = value;
+                if (rel > maxRel) maxRel = rel;
+            }
+        }
+
+        const domain = Math.max(1, seconds, maxRel);
+        const peakScale = peak > 0 ? peak * 1.06 : 1;
+        const parts = [];
+        for (let i = 0; i < points.length; i++) {
+            const x = Math.round((points[i].rel / domain) * W);
+            const y = Math.round(H - 4 - (points[i].value / peakScale) * (H - 12));
+            parts.push(`${x},${y}`);
+        }
+        const line = parts.join(' ');
+
+        GRAPH_GEOM.key = key;
+        GRAPH_GEOM.points = points;
+        GRAPH_GEOM.domain = domain;
+        GRAPH_GEOM.peak = peakScale;
+        GRAPH_GEOM.line = line;
+        GRAPH_GEOM.area = line ? `0,160 ${line} 620,160` : '';
+        return GRAPH_GEOM;
     },
 
     graphPoints() {
-        if (!this.sessionStartMs || !this.recSamples.length) return [];
-        return this.recSamples.map((s) => ({
-            rel: Math.max(0, (Number(s.t) * 1000 - this.sessionStartMs) / 1000),
-            value: this.metricValue(s),
-        }));
+        return this.graphGeometry().points;
     },
 
     graphDomain() {
-        const pts = this.graphPoints();
-        const last = pts.length ? pts[pts.length - 1].rel : 0;
-        return Math.max(1, this.sessionSeconds(), last);
+        return this.graphGeometry().domain;
     },
 
     graphPeak() {
-        const peak = this.graphPoints().reduce((m, p) => Math.max(m, p.value), 0);
-        return peak > 0 ? peak * 1.06 : 1;
-    },
-
-    graphY(value, h = 160) {
-        return Math.round(h - 4 - (value / this.graphPeak()) * (h - 12));
-    },
-
-    graphX(rel, w = 620) {
-        return Math.round((Number(rel) / this.graphDomain()) * w);
+        return this.graphGeometry().peak;
     },
 
     graphLine() {
-        return this.graphPoints().map((p) => `${this.graphX(p.rel)},${this.graphY(p.value)}`).join(' ');
+        return this.graphGeometry().line;
     },
 
     graphArea() {
-        const line = this.graphLine();
-        return line ? `0,160 ${line} 620,160` : '';
+        return this.graphGeometry().area;
     },
 
     graphMarkers() {
