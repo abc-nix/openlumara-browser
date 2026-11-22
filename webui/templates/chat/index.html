@@ -157,6 +157,12 @@
         {# ---------------- EVENTS ---------------- #}
         <div class="bm-view" x-show="mode === 'events'">
 
+            <div class="bm-review" x-show="reviewId">
+                <span>Reviewing <b x-text="reviewId"></b><span x-show="reviewInfoText" x-text="' · ' + reviewInfoText"></span></span>
+                <span class="bm-bar-spacer"></span>
+                <button type="button" class="bm-btn" @click="closeReview()">Back to live</button>
+            </div>
+
             <div class="bm-toolbar bm-event-bar">
                 <button type="button" class="bm-btn" :class="{ on: recording }"
                         @click="toggleRecording()"

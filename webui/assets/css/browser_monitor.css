@@ -782,3 +782,49 @@ body[data-bm] .bm-cover { display: flex; }
     color: var(--text-muted, #888);
     font-size: 10px;
 }
+
+/* Saved takes list in the events section, and the review banner in the cover */
+
+.bm-savedlist {
+    flex: 0 1 auto;
+    max-height: 170px;
+}
+.bm-savedmain {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+}
+.bm-del {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    border: 0;
+    border-radius: 4px;
+    background: none;
+    color: var(--text-muted, #888);
+    cursor: pointer;
+    font-size: 15px;
+    line-height: 1;
+}
+.bm-del:hover { color: #e05c5c; background: rgba(224, 92, 92, 0.12); }
+.bm-review {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border: 1px solid rgba(74, 163, 255, 0.45);
+    border-radius: 6px;
+    background: rgba(74, 163, 255, 0.10);
+    color: var(--text-secondary, #bbb);
+    font-size: 11px;
+}
+.bm-review b { color: var(--accent, #4aa3ff); font-weight: 600; }

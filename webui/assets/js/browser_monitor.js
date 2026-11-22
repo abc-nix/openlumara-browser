@@ -28,6 +28,9 @@ const BROWSER_MONITOR = {
     recIntervalMs: 250,
     samplesTruncated: 0,
     lastSessionId: '',
+    recordings: [],
+    reviewId: '',
+    reviewInfoText: '',
     chartMetric: 'fps',
     hoverRel: null,
     rangeFrom: null,
@@ -58,6 +61,7 @@ const BROWSER_MONITOR = {
         this.error = '';
         await this.refreshTargets();
         await this.poll();
+        await this.refreshRecordings();
     },
 
     async refreshTargets() {
@@ -133,6 +137,7 @@ const BROWSER_MONITOR = {
     },
 
     async pollEvents() {
+        if (this.reviewId) return;   // a saved take is on screen; live data would overwrite it
         try {
             const r = await simpleApiFetch('/api/ext/browser/perf/events?limit=300');
             this.connected = !!r.connected;
@@ -157,6 +162,64 @@ const BROWSER_MONITOR = {
     setMode(mode) {
         this.mode = mode === 'events' ? 'events' : 'resources';
         localStorage.setItem('bm.mode', this.mode);
+        if (this.mode === 'events') this.refreshRecordings();
+        this.poll();
+    },
+
+    // ---- saved takes ---------------------------------------------------
+    async refreshRecordings() {
+        try {
+            const r = await simpleApiFetch('/api/ext/browser/perf/recordings');
+            this.recordings = r.recordings || [];
+        } catch (e) {
+            this.error = 'could not list recordings (' + this.errText(e) + ')';
+        }
+    },
+
+    async openRecording(id) {
+        if (!id) return;
+        try {
+            const r = await simpleApiFetch('/api/ext/browser/perf/recording?id=' + encodeURIComponent(id));
+            this.mode = 'events';
+            localStorage.setItem('bm.mode', 'events');
+            this.reviewId = r.id || id;
+            this.reviewInfoText = [r.started_at_local, r.tab_title || r.tab_url,
+                                   (r.session_seconds || 0) + 's'].filter(Boolean).join(' · ');
+            this.recording = false;
+            this.sessionSecondsValue = r.session_seconds || 0;
+            this.eventCount = r.event_count || 0;
+            this.events = r.events || [];
+            this.handlers = r.handlers || [];
+            this.profileFunctions = r.profile || [];
+            this.profileActive = false;
+            this.recSamples = r.samples || [];
+            this.recIntervalMs = r.sample_interval_ms || 250;
+            this.sessionStartMs = r.session_start_ms || 0;
+            this.samplesTruncated = 0;
+            this.lastSessionId = r.id || this.lastSessionId;
+            this.selectedEvent = null;
+            this.clearRange();
+        } catch (e) {
+            this.error = 'could not open ' + id + ' (' + this.errText(e) + ')';
+        }
+    },
+
+    async deleteRecording(id) {
+        if (!id) return;
+        try {
+            await simpleApiPost('/api/ext/browser/perf/recordings/delete', { id });
+            if (this.reviewId === id) this.reviewId = '';
+            await this.refreshRecordings();
+        } catch (e) {
+            this.error = 'could not delete ' + id + ' (' + this.errText(e) + ')';
+        }
+    },
+
+    closeReview() {
+        this.reviewId = '';
+        this.reviewInfoText = '';
+        this.selectedEvent = null;
+        this.clearRange();
         this.poll();
     },
 
@@ -171,7 +234,13 @@ const BROWSER_MONITOR = {
             this.eventCount = r.event_count || 0;
             this.sessionSecondsValue = r.session_seconds || 0;
             if (r.session_id) this.lastSessionId = r.session_id;
-            if (this.recording) this.clearRange();
+            if (this.recording) {
+                this.reviewId = '';
+                this.reviewInfoText = '';
+                this.clearRange();
+            } else {
+                this.refreshRecordings();
+            }
             await this.pollEvents();
         } catch (e) {
             this.error = 'could not change recording (' + this.errText(e) + ')';

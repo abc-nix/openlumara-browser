@@ -461,6 +461,7 @@ class PerfMonitor:
         self._perf_stop_task = None      # scheduled auto-stop for AI-started takes
         self._perf_stop_at = 0.0
         self._perf_last_stop = {}
+        self._perf_session_tab = {}      # tab id/url/title captured at Record
         self._perf_stop = asyncio.Event()
         self._perf_task = asyncio.create_task(self._perf_loop())
 
@@ -479,6 +480,7 @@ class PerfMonitor:
     def perf_reset(self):
         self._perf_cancel_stop()
         self._perf_last_stop = {}
+        self._perf_session_tab = {}
         self._perf_selected_target = None
         self._perf_recording = False
         self._perf_session_elapsed = 0.0
@@ -889,6 +891,30 @@ class PerfMonitor:
             "wall_ms": int(time.time() * 1000),
         })
 
+    async def _perf_capture_tab(self):
+        """id/url/title of the tab being recorded, so a saved take says where it came from.
+
+        Captured when Record is pressed: the tab can navigate or be closed during
+        the take, and the interesting value is what it was showing when the user
+        hit record.
+        """
+        target = self._perf_selected_target
+        info = {"target_id": target, "url": "", "title": ""}
+        if not target:
+            return info
+        try:
+            listing = await self._perf_targets()
+            for entry in listing.get("targets") or []:
+                if entry.get("id") == target:
+                    info["url"] = entry.get("url") or ""
+                    info["title"] = entry.get("title") or ""
+                    break
+        except Exception:
+            pass
+        if not info["url"]:
+            info["url"] = getattr(self, "_target_url", {}).get(target, "") or ""
+        return info
+
     async def _perf_targets(self):
         if not self._is_connected():
             return {"connected": False, "selected": self._perf_selected_target, "targets": []}
@@ -979,6 +1005,7 @@ class PerfMonitor:
             self._perf_profile_meta = {}
             self._perf_session_elapsed = 0.0
             self._perf_session_start = time.time() * 1000
+            self._perf_session_tab = await self._perf_capture_tab()
             self._perf_recording = True
             await self._perf_agent_start()
             await self._perf_profile_start()
@@ -1074,11 +1101,20 @@ class PerfMonitor:
             return None
         rid = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
         long_frames = sum(1 for e in events if e.get("kind") == "longtask")
+        saved_at = int(time.time() * 1000)
+        started_at = int(self._perf_session_start) if self._perf_session_start > 0 else saved_at
+        tab_info = self._perf_session_tab or {}
+        tab_url = tab_info.get("url") or getattr(self, "_target_url", {}).get(target, "") or ""
         payload = {
             "version": 1,
             "id": rid,
-            "saved_at": int(time.time() * 1000),
+            "started_at": started_at,
+            "started_at_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at / 1000)),
+            "saved_at": saved_at,
+            "saved_at_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(saved_at / 1000)),
             "tab": target,
+            "tab_url": tab_url,
+            "tab_title": tab_info.get("title") or "",
             "session_seconds": self._perf_session_seconds(),
             "session_start_ms": int(self._perf_session_start) if self._perf_session_start > 0 else 0,
             "sample_interval_ms": int(self._perf_rec_interval * 1000),
@@ -1091,8 +1127,13 @@ class PerfMonitor:
         }
         meta = {
             "id": rid,
-            "saved_at": payload["saved_at"],
+            "started_at": started_at,
+            "started_at_local": payload["started_at_local"],
+            "saved_at": saved_at,
+            "saved_at_local": payload["saved_at_local"],
             "tab": target,
+            "tab_url": tab_url,
+            "tab_title": payload["tab_title"],
             "session_seconds": payload["session_seconds"],
             "event_count": len(events),
             "samples": len(samples),
@@ -1165,8 +1206,13 @@ class PerfMonitor:
                         if samples else sum(1 for e in events if e.get("kind") == "longtask"))
         return {
             "recording_id": data.get("id"),
+            "started_at": data.get("started_at"),
+            "started_at_local": data.get("started_at_local"),
             "saved_at": data.get("saved_at"),
+            "saved_at_local": data.get("saved_at_local"),
             "tab": data.get("tab"),
+            "tab_url": data.get("tab_url"),
+            "tab_title": data.get("tab_title"),
             "recording": False,
             "session_seconds": data.get("session_seconds"),
             "event_count": len(events),
@@ -1185,6 +1231,50 @@ class PerfMonitor:
             "resource_latest": samples[-1] if samples else None,
             "resource_samples": len(samples),
         }
+
+    def _perf_recording_for_ui(self, session_id):
+        """One saved take, trimmed for the review view.
+
+        The file can be megabytes; the panel only needs enough to redraw the
+        graph and the first few hundred events, so both are capped here rather
+        than shipping the whole take to the browser.
+        """
+        data = self._perf_load_session(session_id)
+        events = data.get("events") or []
+        samples = data.get("samples") or []
+        return {
+            "id": data.get("id"),
+            "started_at_local": data.get("started_at_local"),
+            "saved_at_local": data.get("saved_at_local"),
+            "tab_url": data.get("tab_url"),
+            "tab_title": data.get("tab_title"),
+            "session_seconds": data.get("session_seconds"),
+            "session_start_ms": data.get("session_start_ms"),
+            "sample_interval_ms": data.get("sample_interval_ms"),
+            "event_count": len(events),
+            "events": events[-400:],
+            "samples": samples[-600:],
+            "handlers": data.get("handlers") or [],
+            "profile": data.get("profile") or [],
+            "profile_meta": data.get("profile_meta") or {},
+        }
+
+    def _perf_delete_recording(self, session_id):
+        name = os.path.basename(str(session_id or "").strip())
+        if not name:
+            raise RuntimeError("No recording id given.")
+        if not name.endswith(".json"):
+            name += ".json"
+        folder = self._perf_recordings_dir()
+        removed = False
+        for path in (os.path.join(folder, name),
+                     os.path.join(folder, name[:-5] + ".meta.json")):
+            try:
+                os.remove(path)
+                removed = True
+            except OSError:
+                pass
+        return {"deleted": name, "ok": removed}
 
     def _perf_session_functions(self, data, min_total_ms=0, limit=20):
         profile = data.get("profile") or []

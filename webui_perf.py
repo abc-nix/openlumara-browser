@@ -36,3 +36,16 @@ class WebuiPerfRoutes(PerfMonitor):
     @webui.route("perf/events/clear", method="POST")
     async def _route_perf_events_clear(self, body=None, query=None):
         return await self._perf_clear_events()
+
+    @webui.route("perf/recordings")
+    async def _route_perf_recordings(self, body=None, query=None):
+        return {"recordings": self._perf_list_recordings(30)}
+
+    @webui.route("perf/recording")
+    async def _route_perf_recording(self, body=None, query=None):
+        session_id = (query or {}).get("id")
+        return self._perf_recording_for_ui(session_id)
+
+    @webui.route("perf/recordings/delete", method="POST")
+    async def _route_perf_recordings_delete(self, body=None, query=None):
+        return self._perf_delete_recording((body or {}).get("id"))
