@@ -32,7 +32,16 @@ class WebuiPerfRoutes(PerfMonitor):
     @webui.route("perf/events")
     async def _route_perf_events(self, body=None, query=None):
         q = query or {}
-        return await self._perf_events(q.get("target_id"), q.get("limit", 300))
+
+        def number(key):
+            try:
+                return float(q.get(key))
+            except (TypeError, ValueError):
+                return None
+
+        return await self._perf_events(q.get("target_id"), q.get("limit", 300),
+                                       since_t=number("since_t"),
+                                       since_start=number("since_start"))
 
     @webui.route("perf/events/clear", method="POST")
     async def _route_perf_events_clear(self, body=None, query=None):

@@ -46,7 +46,13 @@ const BROWSER_MONITOR = {
     recSamples: [],
     sessionStartMs: 0,
     recIntervalMs: 250,
-    samplesTruncated: 0,
+    // `sampleMode` is what the last samples payload was: 'base' (a decimated
+    // view of the whole take, sent when the server cannot know what we hold)
+    // or 'append' (only rows newer than the last one we had). `samplesTotal`
+    // is how many the take really has, so the graph can say when it is
+    // showing a decimated view.
+    samplesTotal: 0,
+    sampleMode: 'base',
     // Events the take lost to the log cap (see perf.py _perf_append_event);
     // `eventsDroppedBeforeMs` is the session time the surviving rows reach.
     eventsDropped: 0,
@@ -186,7 +192,16 @@ const BROWSER_MONITOR = {
     async pollEvents() {
         if (this.reviewId) return;   // a saved take is on screen; live data would overwrite it
         try {
-            const r = await simpleApiFetch('/api/ext/browser/perf/events?limit=300');
+            // Ask only for the samples that arrived since the newest one we hold.
+            // The server ignores that and answers with a decimated base of the
+            // whole take when the ids it is given do not match the live session
+            // (first poll, new take, reconnect), which is what sample_mode says.
+            const lastT = this.recSamples.length
+                ? Number(this.recSamples[this.recSamples.length - 1].t) : 0;
+            const held = lastT && this.sessionStartMs
+                ? '&since_t=' + lastT + '&since_start=' + this.sessionStartMs
+                : '';
+            const r = await simpleApiFetch('/api/ext/browser/perf/events?limit=300' + held);
             this.connected = !!r.connected;
             this.recording = !!r.recording;
             this.sessionSecondsValue = r.session_seconds || 0;
@@ -196,10 +211,15 @@ const BROWSER_MONITOR = {
             if (r.profile_coverage) this.profileCoverage = r.profile_coverage;
             this.events = r.events || [];
             this.handlers = r.handlers || [];
-            this.recSamples = r.samples || [];
+            if (r.sample_mode === 'append' && Array.isArray(r.samples)) {
+                this.recSamples = this.recSamples.concat(r.samples);
+            } else {
+                this.recSamples = r.samples || [];
+            }
+            this.sampleMode = r.sample_mode || 'base';
+            this.samplesTotal = r.samples_total || this.recSamples.length;
             this.recIntervalMs = r.sample_interval_ms || 250;
             this.sessionStartMs = r.session_start_ms || 0;
-            this.samplesTruncated = r.samples_truncated || 0;
             this.eventsDropped = r.events_dropped || 0;
             this.eventsDroppedBeforeMs = r.events_dropped_before_ms || 0;
             this.lastSessionId = r.last_session_id || this.lastSessionId;
@@ -247,7 +267,8 @@ const BROWSER_MONITOR = {
             this.recSamples = r.samples || [];
             this.recIntervalMs = r.sample_interval_ms || 250;
             this.sessionStartMs = r.session_start_ms || 0;
-            this.samplesTruncated = 0;
+            this.samplesTotal = r.samples_total || this.recSamples.length;
+            this.sampleMode = 'base';
             this.eventsDropped = r.events_dropped || 0;
             this.eventsDroppedBeforeMs = r.events_dropped_before_ms || 0;
             this.lastSessionId = r.id || this.lastSessionId;
@@ -405,7 +426,8 @@ const BROWSER_MONITOR = {
             this.selectedEvent = null;
             this.recSamples = [];
             this.sessionStartMs = 0;
-            this.samplesTruncated = 0;
+            this.samplesTotal = 0;
+            this.sampleMode = 'base';
             this.eventsDropped = 0;
             this.eventsDroppedBeforeMs = 0;
             this.lastSessionId = '';
@@ -659,9 +681,13 @@ const BROWSER_MONITOR = {
         const domain = Math.max(1, seconds, maxRel);
         const peakScale = peak > 0 ? peak * 1.06 : 1;
         const parts = [];
+        let firstX = 0;
+        let lastX = W;
         for (let i = 0; i < points.length; i++) {
             const x = Math.round((points[i].rel / domain) * W);
             const y = Math.round(H - 4 - (points[i].value / peakScale) * (H - 12));
+            if (!parts.length) firstX = x;
+            lastX = x;
             parts.push(`${x},${y}`);
         }
         const line = parts.join(' ');
@@ -671,7 +697,11 @@ const BROWSER_MONITOR = {
         GRAPH_GEOM.domain = domain;
         GRAPH_GEOM.peak = peakScale;
         GRAPH_GEOM.line = line;
-        GRAPH_GEOM.area = line ? `0,160 ${line} 620,160` : '';
+        // The fill must close under the data, not at 0 s: pinning it to the
+        // origin painted a wedge from 0 to the first sample, which on a long
+        // take (whose first plotted sample is minutes in) looked like the
+        // recording started late.
+        GRAPH_GEOM.area = line ? `${firstX},160 ${line} ${lastX},160` : '';
         return GRAPH_GEOM;
     },
 
@@ -859,6 +889,18 @@ const BROWSER_MONITOR = {
         const before = Number(this.eventsDroppedBeforeMs) || 0;
         return this.eventsDropped + ' events dropped (log cap)'
             + (before ? ', nothing before ' + (before / 1000).toFixed(1) + ' s' : '');
+    },
+
+    // The graph is a decimated base of the whole take plus exact appends while
+    // one runs. Say which view is on screen instead of letting the point count
+    // imply the take had that many samples.
+    samplesNote() {
+        const total = Number(this.samplesTotal) || this.recSamples.length;
+        const shown = this.recSamples.length;
+        if (total > shown) {
+            return 'decimated: ' + shown + ' of ' + total + ' samples across the whole take';
+        }
+        return shown + ' samples · drag to scope events · tick = long frame';
     },
 
     // The raw CPU stream is ring-buffered: say how much of the take it covers,

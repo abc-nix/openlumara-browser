@@ -266,7 +266,7 @@
                 </div>
                 <div class="bm-graph-foot">
                     <span x-text="metricInfo().label + (metricInfo().unit ? ' (' + metricInfo().unit + ')' : '')"></span>
-                    <span x-text="samplesTruncated ? 'showing the last ' + recSamples.length + ' samples' : 'drag to scope events · tick = long frame'"></span>
+                    <span x-text="samplesNote()"></span>
                 </div>
             </div>
 

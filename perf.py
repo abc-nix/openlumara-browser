@@ -1310,13 +1310,50 @@ class PerfMonitor:
                 "session_seconds": self._perf_session_seconds(),
                 "session_id": session_id}
 
-    async def _perf_events(self, target_id=None, limit=300):
+    @staticmethod
+    def _perf_decimate(rows, cap):
+        """At most `cap` evenly spaced rows, spanning the whole range.
+
+        Sending the newest `cap` rows (the old behaviour) hid the start of a
+        long take: a 463 s take at the 250 ms grid has 1606 rows, so the panel
+        was given 150 s of it and the graph looked like it began minutes late.
+        A stride keeps the shape of the whole session and always ends on the
+        newest row. A live client appends exact rows on top of this base (see
+        `sample_mode` in _perf_events).
+        """
+        rows = list(rows or ())
+        n = len(rows)
+        cap = max(int(cap or 1), 1)
+        if n <= cap:
+            return rows
+        step = n / float(cap)
+        picked = [rows[int(i * step)] for i in range(cap)]
+        picked[-1] = rows[-1]
+        return picked
+
+    async def _perf_events(self, target_id=None, limit=300, since_t=None, since_start=None):
         events = list(self._perf_event_log)
         if target_id:
             events = [e for e in events if e.get("tab") == target_id]
         target = target_id or self._perf_selected_target
         rec = list(self._perf_rec_samples.get(target, ()))
-        cap = 600
+        # Exact up to ~16 min at the 250 ms grid; only a base larger than this is
+        # decimated, because the base is sent once per client (join, reconnect,
+        # review) while every poll after it carries just the new rows.
+        cap = 4000
+        session_start = int(self._perf_session_start) if self._perf_session_start > 0 else 0
+        # Samples are append-only inside one take, so a client that already has
+        # the history only needs what arrived since. A client with nothing (first
+        # poll, reconnect, target switch, new take) gets a decimated base of the
+        # whole take. `since_start` is the client's idea of the session start: if
+        # it does not match, its history belongs to another take and appending
+        # would splice two sessions together, so it gets a base instead.
+        if since_t is not None and session_start and int(since_start or 0) == session_start:
+            samples = [row for row in rec if _number(row.get("t")) > _number(since_t)]
+            sample_mode = "append"
+        else:
+            samples = self._perf_decimate(rec, cap)
+            sample_mode = "base"
         return {
             "connected": self._is_connected(),
             "recording": self._perf_recording,
@@ -1331,10 +1368,11 @@ class PerfMonitor:
             "handlers": self._perf_top_handlers(20),
             # The recording graph is plotted against session_start_ms, which is
             # the same wall clock the samples carry in `t`.
-            "samples": rec[-cap:],
-            "samples_truncated": max(0, len(rec) - cap),
+            "samples": samples,
+            "samples_total": len(rec),
+            "sample_mode": sample_mode,
             "sample_interval_ms": int(self._perf_rec_interval * 1000),
-            "session_start_ms": int(self._perf_session_start) if self._perf_session_start > 0 else 0,
+            "session_start_ms": session_start,
             "last_session_id": (self._perf_last_stop or {}).get("id"),
         }
 
@@ -1575,7 +1613,10 @@ class PerfMonitor:
             "events_dropped": data.get("events_dropped") or 0,
             "events_dropped_before_ms": data.get("events_dropped_before_ms") or 0,
             "events": events[-400:],
-            "samples": samples[-600:],
+            # Whole take: a review must show the beginning too, and the file is
+            # read once here. Only huge takes get decimated (see _perf_events).
+            "samples": self._perf_decimate(samples, 4000),
+            "samples_total": len(samples),
             "handlers": data.get("handlers") or [],
             "profile": data.get("profile") or [],
             "profile_meta": data.get("profile_meta") or {},
