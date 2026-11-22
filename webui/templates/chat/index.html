@@ -167,6 +167,7 @@
                     <span x-text="recording ? 'recording' : 'paused'"></span>
                 </span>
                 <span class="bm-meta"><span x-text="sessionTime()"></span> · <span x-text="eventCount + ' events'"></span></span>
+                <span class="bm-meta" x-show="lastSessionId" :title="'saved to data/browser/recordings'" x-text="'saved: ' + lastSessionId"></span>
                 <span class="bm-bar-spacer"></span>
                 <span class="bm-meta" x-text="'tab: ' + targetLabel()"></span>
             </div>
@@ -249,7 +250,7 @@
                 </div>
                 <div class="bm-graph-foot">
                     <span x-text="metricInfo().label + (metricInfo().unit ? ' (' + metricInfo().unit + ')' : '')"></span>
-                    <span>drag to scope events · tick = long frame</span>
+                    <span x-text="samplesTruncated ? 'showing the last ' + recSamples.length + ' samples' : 'drag to scope events · tick = long frame'"></span>
                 </div>
             </div>
 

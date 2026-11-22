@@ -9,6 +9,8 @@ rAF callbacks and long tasks. All data stays in memory.
 
 import asyncio
 import json
+import os
+import secrets
 import time
 from collections import deque
 
@@ -71,21 +73,21 @@ AGENT_JS = r"""
                            stack: stack, site: site},
                  data: {}, during_scroll: now - this.scrollAt < 200}, now);
     },
-    // A json() call that blocks is invisible in a CPU profile (parsing is
-    // native) yet shows up in LoAF as work on the awaiting script. Recording it
-    // names the endpoint, the payload size and the calling stack, which is what
-    // turns "45 ms in Response.json.then" into a line of code.
-    jsonNote(url, status, bytes, count, dur, stack, at) {
+    // fetch() resolves when the headers arrive, so this duration is round-trip
+    // latency, not parse time. What matters is the body size and who asked:
+    // that is what names the request behind a long frame. Wrapping fetch (and
+    // not json) keeps LoAF free to attribute the reaction to the real script.
+    fetchNote(url, status, bytes, dur, stack, at) {
       if (!this.enabled) return;
       this.push({
-        kind: 'json',
-        name: url || 'response',
+        kind: 'fetch',
+        name: url || 'request',
         duration: dur,
         target: status ? 'HTTP ' + status : 'response',
-        handler: {name: 'json parse', source: '', stack: stack || [],
+        handler: {name: 'fetch', source: '', stack: stack || [],
                   site: stack ? stack.slice(0, 2) : null},
-        data: {bytes: bytes, count: count, status: status},
-        severity: dur >= 16 ? 'warn' : 'info',
+        data: {bytes: bytes, status: status},
+        severity: (bytes && bytes >= 200000) || dur >= 150 ? 'warn' : 'info',
       }, at);
     },
     // A long task has no render phases; a long animation frame does. Splitting
@@ -232,14 +234,15 @@ AGENT_JS = r"""
         }
       });
     };
-    // Native JSON parsing blocks the main thread but never shows up in a CPU
-    // profile, and LoAF only names "the awaiting script". Timing json() and
-    // keeping the fetch call stack turns that into an endpoint, a payload size
-    // and the function that asked for it.
+    // fetch() resolves when the headers arrive, so what this records is the
+    // request, its body size and the code that asked for it - not parse time.
+    // Wrapping fetch (and not json) leaves LoAF free to attribute the reaction
+    // to the real script, which is what a wrapped json() took away.
     const origFetch = window.fetch;
-    const origJson = Response.prototype.json;
-    if (origFetch && origJson) {
+    if (origFetch) {
+      const origin = String((typeof location !== 'undefined' && location.origin) || '');
       window.fetch = function(input, init) {
+        const started = performance.now();
         let stack = null;
         if (M.enabled) {
           try { stack = String(new Error().stack).split('\n').slice(2, 6).map((s) => s.trim()); }
@@ -248,33 +251,17 @@ AGENT_JS = r"""
         const p = origFetch.apply(this, arguments);
         if (!stack) return p;
         return p.then((res) => {
-          try { res.__olCaller = stack; } catch (e) {}
-          return res;
-        });
-      };
-      const origin = String((typeof location !== 'undefined' && location.origin) || '');
-      Response.prototype.json = function() {
-        const started = performance.now();
-        const response = this;
-        const p = origJson.apply(this, arguments);
-        if (!M.enabled) return p;
-        return p.then((data) => {
           try {
-            const url = String((response && response.url) || '').replace(origin, '');
+            const url = String((res && res.url) || '').replace(origin, '');
             // The monitor polls its own extension API every second; those
             // responses are ours and would only add noise.
             if (!url.includes('/api/ext/browser/perf/')) {
               let bytes = null;
-              try { bytes = Number(response.headers.get('content-length')) || null; } catch (e) {}
-              // The API wraps its payload: {success, data:{turns:…}}.
-              const body = data && typeof data === 'object' && data.data !== undefined ? data.data : data;
-              const count = body && Array.isArray(body.turns) ? body.turns.length
-                : (Array.isArray(body) ? body.length : null);
-              M.jsonNote(url, response && response.status, bytes, count,
-                         performance.now() - started, response.__olCaller || null, started);
+              try { bytes = Number(res.headers.get('content-length')) || null; } catch (e) {}
+              M.fetchNote(url, res.status, bytes, performance.now() - started, stack, started);
             }
           } catch (e) {}
-          return data;
+          return res;
         });
       };
     }
@@ -282,10 +269,7 @@ AGENT_JS = r"""
       EventTarget.prototype.addEventListener = origAdd;
       EventTarget.prototype.removeEventListener = origRemove;
       window.requestAnimationFrame = origRaf;
-      if (origFetch && origJson) {
-        window.fetch = origFetch;
-        Response.prototype.json = origJson;
-      }
+      if (origFetch) window.fetch = origFetch;
     };
   }
   return "installed";
@@ -344,7 +328,9 @@ PROBE_JS = r"""
           s.longTotal += 1;
           s.longest = Math.max(s.longest, e.duration || 0);
         }
-      }).observe({entryTypes: ['longtask']});
+      // 'longtask' misses most jank: a long animation frame is a different
+      // entry type, so the per-window count would read 0 while frames run long.
+      }).observe({entryTypes: ['longtask', 'long-animation-frame']});
     } catch (e) {}
     const tick = (t) => {
       s.frames += 1;
@@ -472,10 +458,14 @@ class PerfMonitor:
         self._perf_profile_active = False
         self._perf_profile_sid = None
         self._perf_doc_agents = {}
+        self._perf_stop_task = None      # scheduled auto-stop for AI-started takes
+        self._perf_stop_at = 0.0
+        self._perf_last_stop = {}
         self._perf_stop = asyncio.Event()
         self._perf_task = asyncio.create_task(self._perf_loop())
 
     async def perf_close(self):
+        self._perf_cancel_stop()
         self._perf_stop.set()
         task = getattr(self, "_perf_task", None)
         self._perf_task = None
@@ -487,6 +477,8 @@ class PerfMonitor:
                 pass
 
     def perf_reset(self):
+        self._perf_cancel_stop()
+        self._perf_last_stop = {}
         self._perf_selected_target = None
         self._perf_recording = False
         self._perf_session_elapsed = 0.0
@@ -970,6 +962,11 @@ class PerfMonitor:
         return {"cleared": target_id or "all"}
 
     async def _perf_set_recording(self, recording):
+        # Any explicit state change supersedes a timer: the AI's auto-stop must
+        # never fire into a take the user started afterwards.
+        self._perf_cancel_stop()
+        was_recording = self._perf_recording
+        session_id = None
         if recording:
             self._perf_event_log.clear()
             self._perf_event_seq = 0
@@ -1002,9 +999,17 @@ class PerfMonitor:
                                         sid, timeout=2.0)
             except Exception:
                 pass
+        if was_recording and not self._perf_recording:
+            session_id = self._perf_save_session()
+            self._perf_last_stop = {
+                "id": session_id,
+                "by": "manual",
+                "at": int(time.time() * 1000),
+            } if session_id else {}
         return {"recording": self._perf_recording,
                 "event_count": len(self._perf_event_log),
-                "session_seconds": self._perf_session_seconds()}
+                "session_seconds": self._perf_session_seconds(),
+                "session_id": session_id}
 
     async def _perf_events(self, target_id=None, limit=300):
         events = list(self._perf_event_log)
@@ -1028,9 +1033,12 @@ class PerfMonitor:
             "samples_truncated": max(0, len(rec) - cap),
             "sample_interval_ms": int(self._perf_rec_interval * 1000),
             "session_start_ms": int(self._perf_session_start) if self._perf_session_start > 0 else 0,
+            "last_session_id": (self._perf_last_stop or {}).get("id"),
         }
 
     async def _perf_clear_events(self):
+        self._perf_cancel_stop()
+        self._perf_last_stop = {}
         self._perf_event_log.clear()
         self._perf_handler_stats = {}
         self._perf_rec_samples.clear()
@@ -1044,88 +1052,170 @@ class PerfMonitor:
         return {"recording": False, "event_count": 0, "session_seconds": 0}
 
     # ------------------------------------------------------------------
-    # AI tools: read what the monitor recorded
+    # Saved recordings
     # ------------------------------------------------------------------
-    def _perf_top_handlers(self, limit=8):
-        rows = []
-        for stats in self._perf_handler_stats.values():
-            calls = stats["calls"]
-            name = stats["name"]
-            if name == "anonymous" and stats["site"]:
-                # Unnamed listeners are only distinguishable by where they were
-                # registered, so label them by that site.
-                frame = str(stats["site"][0])[:90]
-                name = f"anonymous @ {frame}"
-            rows.append({
-                "name": name,
-                "type": stats["type"],
-                "calls": calls,
-                "ms": round(stats["ms"], 1),
-                "avg_ms": round(stats["ms"] / calls, 3) if calls else 0.0,
-                "max_ms": round(stats["max_ms"], 2),
-                "scroll_calls": stats["scroll_calls"],
-                "first_ms": stats["first_ms"],
-                "last_ms": stats["last_ms"],
-            })
-        rows.sort(key=lambda r: (r["ms"], r["calls"]), reverse=True)
-        return rows[:limit]
+    def _perf_recordings_dir(self):
+        path = core.get_data_path("browser/recordings")
+        os.makedirs(path, exist_ok=True)
+        return path
 
-    async def browser_monitor_summary(self):
-        """Summarize the browser monitor's current state and last recording.
+    def _perf_save_session(self):
+        """Write the finished take to data/browser/recordings/<id>.json.
 
-        Returns resource snapshot values, event counts by kind, the slowest
-        events, top handlers by time, and the top functions from the last CPU
-        profile. Use this first to decide what to inspect with
-        browser_monitor_events or browser_monitor_functions.
+        Pausing is the natural save point: the events, the fine samples, the
+        folded handler totals and the CPU profile are all in memory by then, and
+        a recording is only worth keeping once it has stopped. A small sidecar
+        .meta.json keeps listing cheap without reading multi-megabyte files.
         """
+        target = self._perf_selected_target
         events = list(self._perf_event_log)
+        samples = list(self._perf_rec_samples.get(target, ()))
+        if not events and not samples:
+            return None
+        rid = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
+        long_frames = sum(1 for e in events if e.get("kind") == "longtask")
+        payload = {
+            "version": 1,
+            "id": rid,
+            "saved_at": int(time.time() * 1000),
+            "tab": target,
+            "session_seconds": self._perf_session_seconds(),
+            "session_start_ms": int(self._perf_session_start) if self._perf_session_start > 0 else 0,
+            "sample_interval_ms": int(self._perf_rec_interval * 1000),
+            "event_count": len(events),
+            "events": events,
+            "samples": samples,
+            "handlers": self._perf_top_handlers(50),
+            "profile": self._perf_profile,
+            "profile_meta": self._perf_profile_meta,
+        }
+        meta = {
+            "id": rid,
+            "saved_at": payload["saved_at"],
+            "tab": target,
+            "session_seconds": payload["session_seconds"],
+            "event_count": len(events),
+            "samples": len(samples),
+            "long_frames": long_frames,
+        }
+        try:
+            folder = self._perf_recordings_dir()
+            with open(os.path.join(folder, rid + ".json"), "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            with open(os.path.join(folder, rid + ".meta.json"), "w", encoding="utf-8") as fh:
+                json.dump(meta, fh, ensure_ascii=False)
+            self._perf_prune_recordings(50)
+            return rid
+        except Exception as e:
+            self.log("browser", f"perf monitor: could not save the recording: {core_detail_error(e)}")
+            return None
+
+    def _perf_prune_recordings(self, keep=50):
+        try:
+            folder = self._perf_recordings_dir()
+            names = sorted((n for n in os.listdir(folder) if n.endswith(".json")
+                            and not n.endswith(".meta.json")), reverse=True)
+            for name in names[max(int(keep), 1):]:
+                for path in (os.path.join(folder, name),
+                             os.path.join(folder, name[:-5] + ".meta.json")):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
+    def _perf_list_recordings(self, limit=20):
+        rows = []
+        try:
+            folder = self._perf_recordings_dir()
+            for name in sorted((n for n in os.listdir(folder) if n.endswith(".meta.json")),
+                               reverse=True)[:max(int(limit or 20), 1)]:
+                try:
+                    with open(os.path.join(folder, name), encoding="utf-8") as fh:
+                        rows.append(json.load(fh))
+                except Exception:
+                    continue
+        except Exception as e:
+            self.log("browser", f"perf monitor: could not list recordings: {core_detail_error(e)}")
+        return rows
+
+    def _perf_load_session(self, session_id):
+        name = os.path.basename(str(session_id or "").strip())
+        if not name:
+            raise RuntimeError("No recording id given.")
+        if not name.endswith(".json"):
+            name += ".json"
+        path = os.path.join(self._perf_recordings_dir(), name)
+        if not os.path.isfile(path):
+            raise RuntimeError(f"No saved recording named '{session_id}'. "
+                               "Use view=\"recordings\" to list them.")
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def _perf_session_summary(self, data):
+        events = data.get("events") or []
         counts = {}
         for e in events:
             kind = e.get("kind", "?")
             counts[kind] = counts.get(kind, 0) + 1
         slowest = sorted(events, key=lambda e: _number(e.get("duration")), reverse=True)[:5]
-        slowest_rows = [{
-            "id": e.get("id"), "rel_ms": e.get("rel_ms"), "kind": e.get("kind"),
-            "name": e.get("name"), "duration_ms": _number(e.get("duration")),
-            "during_scroll": bool(e.get("during_scroll")),
-        } for e in slowest]
-        samples = list(self._perf_samples.get(self._perf_selected_target, ()))
-        latest = samples[-1] if samples else None
-        return self.result({
-            "connected": self._is_connected(),
-            "selected_tab": self._perf_selected_target,
-            "recording": self._perf_recording,
-            "session_seconds": self._perf_session_seconds(),
+        samples = data.get("samples") or []
+        long_session = (sum(int(_number(s.get("long_tasks"))) for s in samples)
+                        if samples else sum(1 for e in events if e.get("kind") == "longtask"))
+        return {
+            "recording_id": data.get("id"),
+            "saved_at": data.get("saved_at"),
+            "tab": data.get("tab"),
+            "recording": False,
+            "session_seconds": data.get("session_seconds"),
             "event_count": len(events),
             "event_counts": counts,
-            "slowest_events": slowest_rows,
-            "top_handlers": self._perf_top_handlers(),
-            "profile_active": self._perf_profile_active,
-            "top_functions": self._perf_profile[:10],
-            "profile_noise": self._perf_profile_meta,
-            "resource_latest": latest,
+            "slowest_events": [{
+                "id": e.get("id"), "rel_ms": e.get("rel_ms"), "kind": e.get("kind"),
+                "name": e.get("name"), "duration_ms": _number(e.get("duration")),
+                "during_scroll": bool(e.get("during_scroll")),
+            } for e in slowest],
+            "top_handlers": data.get("handlers") or [],
+            "profile_active": False,
+            "top_functions": (data.get("profile") or [])[:10],
+            "profile_noise": data.get("profile_meta") or {},
+            "long_tasks_session": long_session,
+            "sample_interval_ms": data.get("sample_interval_ms"),
+            "resource_latest": samples[-1] if samples else None,
             "resource_samples": len(samples),
-        }, success=True)
+        }
 
-    async def browser_monitor_events(self, kinds: list = None, min_duration_ms: float = 0,
-                                     during_scroll: bool = None, search: str = "",
-                                     since_ms: float = None, until_ms: float = None,
-                                     include_details: bool = False, limit: int = 50):
-        """Read the recorded event timeline with optional filters.
+    def _perf_session_functions(self, data, min_total_ms=0, limit=20):
+        profile = data.get("profile") or []
+        rows = [f for f in profile if _number(f.get("total_ms")) >= _number(min_total_ms)]
+        cap = max(min(int(limit or 20), 100), 1)
+        return {
+            "recording_id": data.get("id"),
+            "profile_active": False,
+            "recorded_functions": len(profile),
+            "profile_noise": data.get("profile_meta") or {},
+            "functions": rows[:cap],
+        }
 
-        Args:
-            kinds: only these event kinds (e.g. ["scroll", "longtask", "input", "error"]).
-            min_duration_ms: only events at least this long.
-            during_scroll: true/false to keep only events inside/outside scroll windows.
-            search: case-insensitive text match over event, target and handler.
-            since_ms / until_ms: session-relative window in milliseconds.
-            include_details: include handler source/stack and event data.
-            limit: maximum events to return (capped at 200).
-        """
+    def _perf_session_resources(self, data, limit=60):
+        samples = data.get("samples") or []
+        cap = max(min(int(limit or 60), 300), 1)
+        return {
+            "recording_id": data.get("id"),
+            "sample_interval_ms": data.get("sample_interval_ms"),
+            "samples_returned": len(samples[-cap:]),
+            "latest": samples[-1] if samples else None,
+            "samples": samples[-cap:],
+        }
+
+    def _perf_event_rows(self, events, kinds=None, min_duration_ms=0, during_scroll=None,
+                         search="", since_ms=None, until_ms=None, include_details=False,
+                         limit=50):
         wanted = set(kinds or [])
         term = str(search or "").lower()
         rows = []
-        for e in self._perf_event_log:
+        for e in events:
             rel = _number(e.get("rel_ms"))
             if wanted and e.get("kind") not in wanted:
                 continue
@@ -1157,11 +1247,210 @@ class PerfMonitor:
             rows.append(row)
         rows.sort(key=lambda r: r["rel_ms"])
         cap = max(min(int(limit or 50), 200), 1)
+        return {
+            "matched": len(rows),
+            "returned": min(len(rows), cap),
+            "events": rows[-cap:],
+        }
+
+    # ------------------------------------------------------------------
+    # Auto-stop for AI-started recordings
+    # ------------------------------------------------------------------
+    def _perf_cancel_stop(self):
+        task = getattr(self, "_perf_stop_task", None)
+        self._perf_stop_task = None
+        self._perf_stop_at = 0.0
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _perf_schedule_stop(self, seconds):
+        self._perf_cancel_stop()
+        seconds = max(1, min(int(seconds or 15), 120))
+        self._perf_stop_at = time.time() + seconds
+        self._perf_stop_task = asyncio.create_task(self._perf_auto_stop(seconds))
+        return seconds
+
+    async def _perf_auto_stop(self, seconds):
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+        self._perf_stop_task = None
+        self._perf_stop_at = 0.0
+        if not self._perf_recording:
+            return
+        await self._perf_set_recording(False)
+        stop = dict(self._perf_last_stop or {})
+        stop["by"] = "timer"
+        self._perf_last_stop = stop
+        self.log("browser", f"perf monitor: recording stopped after {seconds}s")
+
+    # ------------------------------------------------------------------
+    # AI tools: read what the monitor recorded
+    # ------------------------------------------------------------------
+    def _perf_top_handlers(self, limit=8):
+        rows = []
+        for stats in self._perf_handler_stats.values():
+            calls = stats["calls"]
+            name = stats["name"]
+            if name == "anonymous" and stats["site"]:
+                # Unnamed listeners are only distinguishable by where they were
+                # registered, so label them by that site.
+                frame = str(stats["site"][0])[:90]
+                name = f"anonymous @ {frame}"
+            rows.append({
+                "name": name,
+                "type": stats["type"],
+                "calls": calls,
+                "ms": round(stats["ms"], 1),
+                "avg_ms": round(stats["ms"] / calls, 3) if calls else 0.0,
+                "max_ms": round(stats["max_ms"], 2),
+                "scroll_calls": stats["scroll_calls"],
+                "first_ms": stats["first_ms"],
+                "last_ms": stats["last_ms"],
+            })
+        rows.sort(key=lambda r: (r["ms"], r["calls"]), reverse=True)
+        return rows[:limit]
+
+    @core.module.tool
+    async def browser_monitor_record(self, action: str = "start", seconds: int = 15,
+                                     restart: bool = False):
+        """Start, stop or inspect a recording session.
+
+        `start` returns immediately and schedules the stop on the server, so the
+        page can be driven (scroll, click) during the window instead of waiting
+        inside the call. Any explicit change - the UI's Pause or Record button, a
+        later start, this tool - cancels that timer, so the user keeps control.
+        Stopping saves the take to data/browser/recordings and returns its id.
+
+        Args:
+            action: start, stop or status.
+            seconds: how long to record, 1-120 (default 15).
+            restart: start a fresh take even if one is already running; this
+                clears the current session (it is saved first).
+        """
+        action = str(action or "start").strip().lower()
+        now = time.time()
+
+        def state():
+            out = {
+                "recording": self._perf_recording,
+                "session_seconds": self._perf_session_seconds(),
+                "event_count": len(self._perf_event_log),
+                "sample_interval_ms": int(self._perf_rec_interval * 1000),
+                "last_session": dict(self._perf_last_stop or {}),
+            }
+            if self._perf_stop_at > 0:
+                out["remaining_s"] = max(0, round(self._perf_stop_at - now, 1))
+            return out
+
+        if action == "status":
+            return self.result(state(), success=True)
+
+        if action == "start":
+            if not self._is_connected() or not self._perf_selected_target:
+                return self.result(
+                    {"error": "No monitored tab: connect the browser and select a tab in the "
+                              "Browser Monitor panel before recording."},
+                    success=False)
+            if self._perf_recording and not restart:
+                out = state()
+                out["hint"] = ("A recording is already running (the user may have started "
+                               "it); it was left untouched. Act now, then call stop.")
+                return self.result(out, success=True)
+            had_session = bool(self._perf_event_log) or bool(
+                self._perf_rec_samples.get(self._perf_selected_target))
+            if restart and self._perf_recording:
+                await self._perf_set_recording(False)
+            await self._perf_set_recording(True)
+            window = self._perf_schedule_stop(seconds)
+            out = state()
+            out.update({"seconds": window, "remaining_s": window,
+                        "cleared_previous": had_session,
+                        "hint": "Interact with the page now; recording stops by itself."})
+            return self.result(out, success=True)
+
+        if action == "stop":
+            was_recording = self._perf_recording
+            stopped = await self._perf_set_recording(False) if was_recording else {}
+            out = state()
+            out["recording_id"] = (stopped or {}).get("session_id")
+            out["hint"] = ("Read it later with browser_monitor(recording_id=...); "
+                           "view=\"recordings\" lists saved takes."
+                           if out["recording_id"] else "Nothing was recording.")
+            return self.result(out, success=True)
+
+        return self.result({"error": "action must be start, stop or status"}, success=False)
+
+    async def browser_monitor_summary(self):
+        """Summarize the browser monitor's current state and last recording.
+
+        Returns resource snapshot values, event counts by kind, the slowest
+        events, top handlers by time, and the top functions from the last CPU
+        profile. Use this first to decide what to inspect with
+        browser_monitor_events or browser_monitor_functions.
+        """
+        events = list(self._perf_event_log)
+        counts = {}
+        for e in events:
+            kind = e.get("kind", "?")
+            counts[kind] = counts.get(kind, 0) + 1
+        slowest = sorted(events, key=lambda e: _number(e.get("duration")), reverse=True)[:5]
+        slowest_rows = [{
+            "id": e.get("id"), "rel_ms": e.get("rel_ms"), "kind": e.get("kind"),
+            "name": e.get("name"), "duration_ms": _number(e.get("duration")),
+            "during_scroll": bool(e.get("during_scroll")),
+        } for e in slowest]
+        samples = list(self._perf_samples.get(self._perf_selected_target, ()))
+        latest = samples[-1] if samples else None
+        # `long_tasks_total` is cumulative since the page loaded, which says
+        # nothing about this take. The session's count is the recorded long
+        # frames/tasks, which is also what the timeline shows.
+        long_session = sum(1 for e in events if e.get("kind") == "longtask")
         return self.result({
-            "matched": len(rows), "returned": min(len(rows), cap),
+            "connected": self._is_connected(),
+            "selected_tab": self._perf_selected_target,
+            "recording": self._perf_recording,
+            "last_session_id": (self._perf_last_stop or {}).get("id"),
+            "session_seconds": self._perf_session_seconds(),
+            "event_count": len(events),
+            "event_counts": counts,
+            "slowest_events": slowest_rows,
+            "top_handlers": self._perf_top_handlers(),
+            "profile_active": self._perf_profile_active,
+            "top_functions": self._perf_profile[:10],
+            "profile_noise": self._perf_profile_meta,
+            "long_tasks_session": long_session,
+            "resource_latest": latest,
+            "resource_samples": len(samples),
+        }, success=True)
+
+    async def browser_monitor_events(self, kinds: list = None, min_duration_ms: float = 0,
+                                     during_scroll: bool = None, search: str = "",
+                                     since_ms: float = None, until_ms: float = None,
+                                     include_details: bool = False, limit: int = 50):
+        """Read the recorded event timeline with optional filters.
+
+        Args:
+            kinds: only these event kinds (e.g. ["scroll", "longtask", "input", "fetch", "error"]).
+            min_duration_ms: only events at least this long.
+            during_scroll: true/false to keep only events inside/outside scroll windows.
+            search: case-insensitive text match over event, target and handler.
+            since_ms / until_ms: session-relative window in milliseconds.
+            include_details: include handler source/stack and event data.
+            limit: maximum events to return (capped at 200).
+        """
+        rows = self._perf_event_rows(
+            list(self._perf_event_log), kinds=kinds, min_duration_ms=min_duration_ms,
+            during_scroll=during_scroll, search=search, since_ms=since_ms,
+            until_ms=until_ms, include_details=include_details, limit=limit)
+        return self.result({
+            "connected": self._is_connected(),
             "recording": self._perf_recording,
             "session_seconds": self._perf_session_seconds(),
-            "events": rows[-cap:],
+            "matched": rows["matched"],
+            "returned": rows["returned"],
+            "events": rows["events"],
         }, success=True)
 
     async def browser_monitor_functions(self, min_total_ms: float = 0, limit: int = 20):
@@ -1206,16 +1495,22 @@ class PerfMonitor:
         }, success=True)
 
     @core.module.tool
+    @core.module.tool
     async def browser_monitor(self, view: str = "all", kinds: list = None,
                               min_duration_ms: float = 0, during_scroll: bool = None,
                               search: str = "", since_ms: float = None,
                               until_ms: float = None, include_details: bool = False,
                               limit: int = 50, min_total_ms: float = 0,
-                              target_id: str = None):
+                              target_id: str = None, recording_id: str = None):
         """Read the browser monitor's recording and resource data.
 
+        Readings are live by default. Recordings are written to
+        data/browser/recordings/<id>.json every time a recording stops (the UI's
+        Pause or browser_monitor_record); pass `recording_id` to read one from
+        disk later, and view="recordings" to list the saved ones.
+
         Args:
-            view: what to return: all, summary, events, functions, resources.
+            view: all, summary, events, functions, resources, or recordings.
             kinds: event kinds filter for events.
             min_duration_ms: minimum event duration for events.
             during_scroll: only inside/outside scroll windows for events.
@@ -1225,15 +1520,41 @@ class PerfMonitor:
             limit: maximum events (or resource samples) to return.
             min_total_ms: minimum total time for functions.
             target_id: resource tab; defaults to the monitor's selected tab.
+            recording_id: read a saved recording instead of the live session.
         """
         def content(result):
             return result.get("content", result) if isinstance(result, dict) else result
 
         view = str(view or "all").lower()
+        if view == "recordings":
+            return self.result({"recordings": self._perf_list_recordings(20)}, success=True)
         if view not in ("all", "summary", "events", "functions", "resources"):
             view = "all"
+
+        if recording_id:
+            saved = self._perf_load_session(recording_id)
+            data = {"view": view, "recording_id": saved.get("id"),
+                    "session_seconds": saved.get("session_seconds")}
+            if view in ("all", "summary"):
+                data["summary"] = self._perf_session_summary(saved)
+            if view in ("all", "events"):
+                rows = self._perf_event_rows(
+                    saved.get("events") or [], kinds=kinds,
+                    min_duration_ms=min_duration_ms, during_scroll=during_scroll,
+                    search=search, since_ms=since_ms, until_ms=until_ms,
+                    include_details=include_details, limit=limit)
+                data["events"] = {"matched": rows["matched"],
+                                  "returned": rows["returned"], "events": rows["events"]}
+            if view in ("all", "functions"):
+                data["functions"] = self._perf_session_functions(
+                    saved, min_total_ms=min_total_ms, limit=limit)
+            if view in ("all", "resources"):
+                data["resources"] = self._perf_session_resources(saved, limit=limit)
+            return self.result(data, success=True)
+
         data = {"view": view, "recording": self._perf_recording,
-                "session_seconds": self._perf_session_seconds()}
+                "session_seconds": self._perf_session_seconds(),
+                "last_session_id": (self._perf_last_stop or {}).get("id")}
         if view in ("all", "summary"):
             data["summary"] = content(await self.browser_monitor_summary())
         if view in ("all", "events"):

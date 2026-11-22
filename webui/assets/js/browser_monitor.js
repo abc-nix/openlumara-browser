@@ -26,6 +26,8 @@ const BROWSER_MONITOR = {
     recSamples: [],
     sessionStartMs: 0,
     recIntervalMs: 250,
+    samplesTruncated: 0,
+    lastSessionId: '',
     chartMetric: 'fps',
     hoverRel: null,
     rangeFrom: null,
@@ -36,7 +38,7 @@ const BROWSER_MONITOR = {
     error: '',
     busy: false,
     filterKind: 'all',
-    filterKinds: ['all', 'scroll', 'input', 'raf', 'longtask', 'json', 'console', 'network', 'navigation', 'error'],
+    filterKinds: ['all', 'scroll', 'input', 'raf', 'longtask', 'fetch', 'json', 'console', 'network', 'navigation', 'error'],
     minDuration: 0,
     duringScrollOnly: false,
     eventSearch: '',
@@ -144,6 +146,8 @@ const BROWSER_MONITOR = {
             this.recSamples = r.samples || [];
             this.recIntervalMs = r.sample_interval_ms || 250;
             this.sessionStartMs = r.session_start_ms || 0;
+            this.samplesTruncated = r.samples_truncated || 0;
+            this.lastSessionId = r.last_session_id || this.lastSessionId;
         } catch (e) {
             this.connected = false;
             this.error = this.errText(e);
@@ -166,6 +170,7 @@ const BROWSER_MONITOR = {
             this.recording = !!r.recording;
             this.eventCount = r.event_count || 0;
             this.sessionSecondsValue = r.session_seconds || 0;
+            if (r.session_id) this.lastSessionId = r.session_id;
             if (this.recording) this.clearRange();
             await this.pollEvents();
         } catch (e) {
@@ -203,6 +208,8 @@ const BROWSER_MONITOR = {
             this.selectedEvent = null;
             this.recSamples = [];
             this.sessionStartMs = 0;
+            this.samplesTruncated = 0;
+            this.lastSessionId = '';
             this.clearRange();
         } catch (e) {
             this.error = 'could not clear events (' + this.errText(e) + ')';
@@ -568,8 +575,8 @@ const BROWSER_MONITOR = {
     filterLabel(kind) {
         return {
             all: 'All', scroll: 'Scroll', input: 'Input', raf: 'RAF',
-            longtask: 'Long tasks', json: 'JSON parse', console: 'Console',
-            network: 'Network', navigation: 'Nav', error: 'Errors',
+            longtask: 'Long tasks', fetch: 'Fetch', json: 'JSON parse (legacy)',
+            console: 'Console', network: 'Network', navigation: 'Nav', error: 'Errors',
         }[kind] || kind;
     },
 
