@@ -37,7 +37,11 @@
 
     <div class="bm-tablist-head">
         <span>Tabs</span>
-        <span x-text="targets.length"></span>
+        <span class="bm-tabcount">
+            <span x-text="targets.length"></span>
+            <button type="button" class="bm-tabrefresh" @click="refreshTargets()"
+                    title="refresh the tab list">↻</button>
+        </span>
     </div>
     <div class="bm-tablist">
         <template x-for="t in targets">
@@ -51,7 +55,8 @@
                 <span class="bm-tabact" x-show="t.active" title="visible tab">●</span>
             </button>
         </template>
-        <div class="bm-empty" x-show="!targets.length">No browser tabs. Open the browser module first.</div>
+        <div class="bm-empty" x-show="!targets.length"
+             x-text="connected ? 'No tabs listed yet — press ↻ to refresh.' : 'Browser not connected yet.'"></div>
     </div>
 
     <template x-if="mode === 'resources'">

@@ -47,6 +47,7 @@ const BROWSER_MONITOR = {
     eventSearch: '',
     selectedEvent: null,
     _timer: null,
+    _targetsAt: 0,
 
     init() {
         if (!this._timer) {
@@ -88,10 +89,26 @@ const BROWSER_MONITOR = {
                 localStorage.setItem('bm.target', r.selected);
             }
         } catch (e) {
+            // Keep the last list: a transient failure (the browser is still
+            // starting) should not blank the panel.
             this.error = 'could not read tabs (' + this.errText(e) + ')';
-            this.connected = false;
-            this.targets = [];
         }
+    },
+
+    // The tab list used to be fetched once at mount, so a browser that
+    // connected afterwards left the sidebar saying "no tabs" while samples were
+    // flowing. Poll the list whenever it is empty or the summary names a tab
+    // that is not in it, at most every few seconds.
+    maybeRefreshTargets(selected) {
+        if (!this.connected) return;
+        const now = Date.now();
+        const missing = selected && !this.targets.some((t) => t.id === selected);
+        // New tabs (the browser tools open them) should show up without the
+        // user hunting for the refresh button.
+        const stale = !this._targetsAt || now - this._targetsAt > 10000;
+        if (!missing && !stale) return;
+        this._targetsAt = now;
+        this.refreshTargets();
     },
 
     async selectTarget(id) {
@@ -130,6 +147,7 @@ const BROWSER_MONITOR = {
                 this.targetId = r.selected;
                 localStorage.setItem('bm.target', r.selected);
             }
+            this.maybeRefreshTargets(r.selected);
         } catch (e) {
             this.connected = false;
             this.error = this.errText(e);
@@ -153,6 +171,7 @@ const BROWSER_MONITOR = {
             this.sessionStartMs = r.session_start_ms || 0;
             this.samplesTruncated = r.samples_truncated || 0;
             this.lastSessionId = r.last_session_id || this.lastSessionId;
+            this.maybeRefreshTargets(this.targetId);
         } catch (e) {
             this.connected = false;
             this.error = this.errText(e);
@@ -303,7 +322,10 @@ const BROWSER_MONITOR = {
 
     targetLabel() {
         const t = this.currentTarget();
-        return t ? (t.title || t.id) : 'no tab selected';
+        if (t) return t.title || t.id;
+        // The summary can know the selected tab before the list arrives; say so
+        // instead of claiming nothing is selected.
+        return this.targetId ? 'tab ' + String(this.targetId).slice(-6) : 'no tab selected';
     },
 
     statusLine() {
@@ -682,6 +704,13 @@ const BROWSER_MONITOR = {
 
     handlerName(event) {
         return event && event.handler && event.handler.name ? event.handler.name : '—';
+    },
+
+    // Bursts (scroll, pointer, network) are folded per window server-side; the
+    // row says how many ran without turning into one row each.
+    eventName(event) {
+        const n = Number(event && event.data && event.data.count) || 1;
+        return (event && event.name ? event.name : '') + (n > 1 ? ' ×' + n : '');
     },
 
     fmtRel(ms) {

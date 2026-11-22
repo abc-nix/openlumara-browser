@@ -828,3 +828,17 @@ body[data-bm] .bm-cover { display: flex; }
     font-size: 11px;
 }
 .bm-review b { color: var(--accent, #4aa3ff); font-weight: 600; }
+
+/* Tab list header: count plus a manual refresh (the list also self-refreshes) */
+.bm-tabcount { display: inline-flex; align-items: center; gap: 6px; }
+.bm-tabrefresh {
+    border: 0;
+    background: none;
+    color: var(--text-muted, #888);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    padding: 0 2px;
+    border-radius: 3px;
+}
+.bm-tabrefresh:hover { color: var(--accent, #4aa3ff); background: rgba(74, 163, 255, 0.12); }

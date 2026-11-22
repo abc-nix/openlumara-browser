@@ -323,7 +323,7 @@
                                     @click="selectEvent(e)">
                                 <span class="bm-ev-time" x-text="fmtRel(e.rel_ms)"></span>
                                 <span class="bm-ev-kind"><i class="bm-kind-dot"></i><span x-text="e.kind"></span></span>
-                                <span class="bm-ev-name" x-text="e.name"></span>
+                                <span class="bm-ev-name" x-text="eventName(e)"></span>
                                 <span class="bm-ev-target" x-text="e.target"></span>
                                 <span class="bm-ev-handler" x-text="handlerName(e)"></span>
                                 <span class="bm-ev-dur" x-text="e.duration.toFixed(1) + ' ms'"></span>
@@ -346,6 +346,10 @@
                         <span x-text="selectedEvent ? selectedEvent.duration.toFixed(1) + ' ms' : ''"></span>
                     </div>
                     <div class="bm-detail-row"><span>target</span><code x-text="selectedEvent?.target || ''"></code></div>
+                    <div class="bm-detail-row" x-show="selectedEvent?.data?.count > 1">
+                        <span>folded</span>
+                        <code x-text="selectedEvent.data.count + '× in this window · ' + selectedEvent.data.ms_total + ' ms total'"></code>
+                    </div>
                     <div class="bm-detail-row"><span>handler</span><code x-text="handlerName(selectedEvent)"></code></div>
                     <div class="bm-detail-row"><span>during scroll</span><code x-text="selectedEvent?.during_scroll ? 'yes' : 'no'"></code></div>
                     <div class="bm-detail-row" x-show="selectedEvent?.data?.bytes != null">

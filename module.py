@@ -182,6 +182,11 @@ class Browser(CdpEvents, RestartState, WebuiRoutes, WebuiPerfRoutes,
             "min": 200,
             "max": 20000,
         },
+        "perf_record_static_network": {
+            "type": "boolean",
+            "description": "Also record image, font, stylesheet and script requests while a recording runs. Off by default: those are the bulk of the rows and rarely the story, so takes keep only document, XHR, fetch and websocket traffic.",
+            "default": False,
+        },
         "perf_collect_fps": {
             "type": "boolean",
             "description": "Inject a tiny requestAnimationFrame + long-task probe into the selected tab to report FPS and long tasks.",

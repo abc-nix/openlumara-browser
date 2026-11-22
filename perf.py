@@ -422,12 +422,29 @@ def build_sample(prev, cur, dt, probe=None):
     }
 
 
+# Kinds that arrive in bursts and are folded per window (see _perf_append_event).
+_PERF_MERGE_KINDS = ("scroll", "input", "network")
+
+# Recorded network events are limited to these CDP resource types unless
+# perf_record_static_network is on: images, fonts, styles and scripts are noise
+# in a take, requests are the story.
+_PERF_NET_KEEP = ("Document", "XHR", "Fetch", "WebSocket", "EventSource")
+
+# Payload-level chatter (one entry per websocket frame, per chunk) says nothing
+# about what the page did; the request and its response do.
+_PERF_NET_METHODS = ("Network.requestWillBeSent", "Network.responseReceived",
+                     "Network.loadingFailed", "Network.webSocketCreated",
+                     "Network.webSocketClosed")
+
+
 def _cdp_kind(method):
     if method in ("Runtime.consoleAPICalled", "Log.entryAdded"):
         return "console"
     if method in ("Runtime.exceptionThrown", "Network.loadingFailed"):
         return "error"
-    if method in ("Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished"):
+    # Every Network.* method used to fall through to "input" here, so websocket
+    # frames and dataReceived showed up as input events and inflated that count.
+    if method.startswith("Network."):
         return "network"
     if method in ("Page.frameNavigated", "Target.targetCreated", "Target.targetDestroyed", "Target.targetCrashed"):
         return "navigation"
@@ -453,6 +470,8 @@ class PerfMonitor:
         self._perf_rec_samples = {}
         self._perf_rec_last = {}
         self._perf_probe_acc = {}
+        self._perf_merged = {}
+        self._perf_merge_window_ms = max(self._perf_rec_interval * 1000, 250)
         self._perf_recording = False
         self._perf_session_start = 0
         self._perf_session_elapsed = 0.0
@@ -496,6 +515,7 @@ class PerfMonitor:
         self._perf_rec_samples = {}
         self._perf_rec_last = {}
         self._perf_probe_acc = {}
+        self._perf_merged = {}
         self._perf_profile = []
         self._perf_profile_meta = {}
         self._perf_profile_active = False
@@ -804,6 +824,39 @@ class PerfMonitor:
         item.setdefault("during_scroll", False)
         item["rel_ms"] = _number(item.get("rel_ms"))
         item["wall_ms"] = int(item.get("wall_ms") or time.time() * 1000)
+
+        # Scrolling, pointer movement and network traffic arrive in bursts. One
+        # row per (kind, name, window) keeps how many happened and the worst
+        # duration in that window, instead of one timeline row every 40 ms that
+        # buries everything else. The row keeps the first event's id and time.
+        bucket = None
+        if item.get("kind") in _PERF_MERGE_KINDS:
+            bucket = int(item["rel_ms"] // self._perf_merge_window_ms)
+        if bucket is not None:
+            key = (item.get("kind"), item.get("name"), bucket)
+            merged = self._perf_merged.get(key)
+            if merged is not None:
+                data = merged.setdefault("data", {})
+                data["count"] = int(data.get("count") or 1) + 1
+                data["ms_total"] = round(
+                    _number(data.get("ms_total")) + _number(item.get("duration")), 2)
+                if _number(item.get("duration")) > _number(merged.get("duration")):
+                    merged["duration"] = item["duration"]
+                    merged["severity"] = item["severity"]
+                # A request and its response fold into one row: keep the method
+                # from the first and the status from the second.
+                for extra_key, extra_value in (item.get("data") or {}).items():
+                    if extra_key not in ("count", "ms_total") and extra_value not in (None, ""):
+                        data.setdefault(extra_key, extra_value)
+                merged["during_scroll"] = (bool(merged.get("during_scroll"))
+                                           or bool(item.get("during_scroll")))
+                return
+            item["data"]["count"] = 1
+            item["data"]["ms_total"] = round(_number(item.get("duration")), 2)
+            if len(self._perf_merged) > 2000:
+                # Their rows have long left the log; only the map would grow.
+                self._perf_merged.clear()
+            self._perf_merged[key] = item
         self._perf_event_log.append(item)
 
     def _perf_merge_handler(self, row):
@@ -855,7 +908,14 @@ class PerfMonitor:
         if not self._perf_recording or self._perf_session_start <= 0:
             return
         params = params or {}
+        if (method.startswith("Network.")
+                and not self.config.get("perf_record_static_network", False)):
+            rtype = params.get("type") or ""
+            if rtype and rtype not in _PERF_NET_KEEP:
+                return
         kind = _cdp_kind(method)
+        if method.startswith("Network.") and method not in _PERF_NET_METHODS:
+            return
         text = ""
         target = self._target_of_session(sid) or ""
         data = {}
@@ -872,12 +932,16 @@ class PerfMonitor:
             target = entry.get("url") or target
         elif method == "Network.requestWillBeSent":
             req = params.get("request", {}) or {}
-            text = f"{req.get('method', '?')} {req.get('url', '')}"
-            target = req.get("url", "")
+            # Named by url so the response for the same request folds into this
+            # row; the method and status ride along in data.
+            text = req.get("url", "")
+            target = text
+            data["method"] = req.get("method", "?")
         elif method == "Network.responseReceived":
             resp = params.get("response", {}) or {}
-            text = f"{resp.get('status')} {resp.get('url', '')}"
-            target = resp.get("url", "")
+            text = resp.get("url", "")
+            target = text
+            data["status"] = resp.get("status")
         elif method == "Network.loadingFailed":
             text = params.get("errorText", "request failed")
         elif method == "Page.frameNavigated":
@@ -1029,6 +1093,7 @@ class PerfMonitor:
             self._perf_event_log.clear()
             self._perf_event_seq = 0
             self._perf_handler_stats = {}
+            self._perf_merged = {}
             target = self._perf_selected_target
             self._perf_rec_samples.pop(target, None)
             self._perf_rec_last.pop(target, None)
@@ -1103,6 +1168,7 @@ class PerfMonitor:
         await self._perf_network(False)
         self._perf_event_log.clear()
         self._perf_handler_stats = {}
+        self._perf_merged = {}
         self._perf_rec_samples.clear()
         self._perf_rec_last.clear()
         self._perf_probe_acc.clear()
@@ -1237,8 +1303,10 @@ class PerfMonitor:
             counts[kind] = counts.get(kind, 0) + 1
         slowest = sorted(events, key=lambda e: _number(e.get("duration")), reverse=True)[:5]
         samples = data.get("samples") or []
-        long_session = (sum(int(_number(s.get("long_tasks"))) for s in samples)
-                        if samples else sum(1 for e in events if e.get("kind") == "longtask"))
+        # Count the recorded long frames, exactly like the live summary: the
+        # per-window probe total can miss a frame that started before the first
+        # window and says nothing about the take as a whole.
+        long_session = sum(1 for e in events if e.get("kind") == "longtask")
         return {
             "recording_id": data.get("id"),
             "started_at": data.get("started_at"),
@@ -1358,11 +1426,17 @@ class PerfMonitor:
                       f"{handler.get('name', '') if isinstance(handler, dict) else ''}".lower()
                 if term not in hay:
                     continue
+            data = e.get("data") or {}
             row = {
                 "id": e.get("id"), "rel_ms": rel, "kind": e.get("kind"),
                 "name": e.get("name"), "duration_ms": _number(e.get("duration")),
                 "target": e.get("target"), "severity": e.get("severity"),
                 "during_scroll": bool(e.get("during_scroll")),
+                # Bursts are folded per window; `count` says how many ran and
+                # `ms_total` what they cost together.
+                "count": int(_number(data.get("count")) or 1),
+                "ms_total": round(_number(data.get("ms_total")
+                                          if "ms_total" in data else e.get("duration")), 2),
                 "handler_name": (e.get("handler") or {}).get("name")
                                 if isinstance(e.get("handler"), dict) else "—",
             }
