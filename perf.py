@@ -18,8 +18,8 @@ AGENT_JS = r"""
 (() => {
   if (window.__olMonitor) return "exists";
   const M = window.__olMonitor = {
-    enabled: true, installed: false, events: [], cap: 1200,
-    sessionStart: performance.now(), scrollAt: 0, seq: 0,
+    enabled: true, installed: false, events: [], agg: {}, cap: 1200, slowMs: 8,
+    sessionStart: performance.now(), scrollAt: -1e9, seq: 0,
     push(e) {
       if (!this.enabled) return;
       this.seq += 1;
@@ -32,9 +32,83 @@ AGENT_JS = r"""
       this.events.push(e);
       if (this.events.length > this.cap) this.events.shift();
     },
-    start() { this.enabled = true; this.sessionStart = performance.now(); this.events = []; },
+    // Listener calls are counted here, in the page: a scroll spy fires dozens
+    // of times per second at a fraction of a millisecond each, and shipping
+    // every call over CDP drowns the timeline in events that carry no signal.
+    // One row per (handler, event type, registration site); an individual event
+    // is kept only when a call is actually slow.
+    note(type, el, listener, site, dur) {
+      if (!this.enabled) return;
+      const now = performance.now();
+      const name = listener.name || 'anonymous';
+      const key = type + '|' + name + '|' + ((site && site[0]) || '');
+      let row = this.agg[key];
+      if (!row) {
+        row = this.agg[key] = {
+          kind: 'input', name: type, calls: 0, ms: 0, max_ms: 0, scroll_calls: 0,
+          first_ms: 0, last_ms: 0, target: describe(el),
+          handler: {name: name, site: site, source: String(listener).slice(0, 300)},
+        };
+      }
+      if (!row.calls) row.first_ms = Math.round((now - this.sessionStart) * 10) / 10;
+      row.calls += 1;
+      row.ms += dur;
+      row.max_ms = Math.max(row.max_ms, dur);
+      if (now - this.scrollAt < 200) row.scroll_calls += 1;
+      row.last_ms = Math.round((now - this.sessionStart) * 10) / 10;
+      if (dur < this.slowMs) return;
+      let stack = null;
+      try { stack = String(new Error().stack).split('\n').slice(2, 6).map((s) => s.trim()); }
+      catch (e) {}
+      this.push({kind: 'input', name: type, duration: dur, target: describe(el),
+                 handler: {name: name, source: String(listener).slice(0, 300),
+                           stack: stack, site: site},
+                 data: {}, during_scroll: now - this.scrollAt < 200});
+    },
+    // A long task has no render phases; a long animation frame does. Splitting
+    // it into work / render / style+layout is what says whether a frame was JS
+    // or rendering - renderStart and styleAndLayoutStart exist only on LoAF.
+    frameData(e) {
+      const ms = (v) => Math.round((v || 0) * 10) / 10;
+      const end = (e.startTime || 0) + (e.duration || 0);
+      const renderStart = e.renderStart || 0;
+      const slStart = e.styleAndLayoutStart || 0;
+      const scripts = (e.scripts || []).slice(0, 12).map((s) => ({
+        name: s.sourceFunctionName || s.invoker || 'anonymous',
+        url: s.sourceURL || '',
+        position: s.sourceCharPosition || 0,
+        invoker: s.invoker || '',
+        invokerType: s.invokerType || '',
+        forced_ms: ms(s.forcedStyleAndLayoutDuration),
+        duration: ms(s.duration),
+      }));
+      return {
+        scripts: scripts,
+        entryType: e.entryType || '',
+        work_ms: renderStart ? ms(renderStart - (e.startTime || 0)) : ms(e.duration),
+        render_ms: renderStart ? ms(end - renderStart) : 0,
+        pre_layout_ms: (renderStart && slStart) ? ms(slStart - renderStart) : 0,
+        style_layout_ms: slStart ? ms(end - slStart) : 0,
+        blocking_ms: ms(e.blockingDuration),
+        paint_ms: e.paintTime ? ms(e.paintTime - (e.startTime || 0)) : 0,
+        first_ui_ms: e.firstUIEventTimestamp
+          ? ms(e.firstUIEventTimestamp - (e.startTime || 0)) : 0,
+      };
+    },
+    start() {
+      this.enabled = true;
+      this.sessionStart = performance.now();
+      this.events = [];
+      this.agg = {};
+    },
     stop() { this.enabled = false; },
-    drain() { const out = this.events; this.events = []; return out; },
+    drain() {
+      const out = this.events;
+      const handlers = Object.keys(this.agg).map((k) => this.agg[k]);
+      this.events = [];
+      this.agg = {};
+      return {events: out, handlers: handlers};
+    },
   };
 
   const describe = (el) => {
@@ -48,19 +122,11 @@ AGENT_JS = r"""
   };
 
   try {
-    new PerformanceObserver((list) => list.getEntries().forEach((e) => {
-      const scripts = (e.scripts || []).slice(0, 12).map((s) => ({
-        name: s.sourceFunctionName || s.invoker || 'anonymous',
-        url: s.sourceURL || '',
-        position: s.sourceCharPosition || 0,
-        invoker: s.invoker || '',
-        duration: Math.round((s.duration || 0) * 10) / 10,
-      }));
-      M.push({kind: 'longtask', name: e.name || e.entryType || 'longtask',
-              duration: e.duration, target: 'main thread', handler: null,
-              data: {scripts: scripts, entryType: e.entryType},
-              severity: e.duration > 50 ? 'warn' : 'info'});
-    })).observe({entryTypes: ['longtask', 'long-animation-frame']});
+    new PerformanceObserver((list) => list.getEntries().forEach((e) => M.push({
+      kind: 'longtask', name: e.name || e.entryType || 'longtask',
+      duration: e.duration, target: 'main thread', handler: null,
+      data: M.frameData(e), severity: e.duration > 50 ? 'warn' : 'info',
+    }))).observe({entryTypes: ['longtask', 'long-animation-frame']});
   } catch (e) {}
 
   try {
@@ -86,6 +152,8 @@ AGENT_JS = r"""
     M.installed = true;
     const origAdd = EventTarget.prototype.addEventListener;
     const origRemove = EventTarget.prototype.removeEventListener;
+    // listener -> {type: wrapper}. One function can be registered for several
+    // event types, so the wrapper has to remember the type it was made for.
     const wrapped = new WeakMap();
     const types = new Set(['scroll', 'wheel', 'pointerdown', 'pointermove', 'pointerup', 'keydown', 'click', 'resize']);
 
@@ -93,7 +161,12 @@ AGENT_JS = r"""
       if (!types.has(type) || typeof listener !== 'function') {
         return origAdd.call(this, type, listener, options);
       }
-      let w = wrapped.get(listener);
+      let byType = wrapped.get(listener);
+      if (!byType) {
+        byType = {};
+        wrapped.set(listener, byType);
+      }
+      let w = byType[type];
       if (!w) {
         // Captured once, at registration: the invocation stack says who fired
         // the handler, this says which code registered it - the only thing
@@ -106,27 +179,17 @@ AGENT_JS = r"""
           if (!M.enabled) return listener.call(this, ev);
           const t0 = performance.now();
           try { return listener.call(this, ev); }
-          finally {
-            const dur = performance.now() - t0;
-            let stack = null;
-            if (dur > 4) {
-              try { stack = String(new Error().stack).split('\n').slice(2, 6).map((s) => s.trim()); }
-              catch (e) {}
-            }
-            M.push({kind: 'input', name: type, duration: dur, target: describe(this),
-                    handler: {name: listener.name || 'anonymous',
-                              source: String(listener).slice(0, 300), stack: stack, site: site},
-                    data: {}, during_scroll: performance.now() - M.scrollAt < 200});
-          }
+          finally { M.note(type, this, listener, site, performance.now() - t0); }
         };
         w.__olOriginal = listener;
-        wrapped.set(listener, w);
+        byType[type] = w;
       }
       return origAdd.call(this, type, w, options);
     };
 
     EventTarget.prototype.removeEventListener = function(type, listener, options) {
-      return origRemove.call(this, type, wrapped.get(listener) || listener, options);
+      const byType = wrapped.get(listener);
+      return origRemove.call(this, type, (byType && byType[type]) || listener, options);
     };
 
     const origRaf = window.requestAnimationFrame;
@@ -287,6 +350,7 @@ class PerfMonitor:
         self._perf_session_elapsed = 0.0
         self._perf_event_log = deque(maxlen=max(int(self.config.get("perf_events_max", 5000) or 5000), 100))
         self._perf_event_seq = 0
+        self._perf_handler_stats = {}
         self._perf_profile = []
         self._perf_profile_meta = {}
         self._perf_profile_active = False
@@ -310,6 +374,7 @@ class PerfMonitor:
         self._perf_selected_target = None
         self._perf_recording = False
         self._perf_session_elapsed = 0.0
+        self._perf_handler_stats = {}
         self._perf_profile = []
         self._perf_profile_meta = {}
         self._perf_profile_active = False
@@ -553,14 +618,19 @@ class PerfMonitor:
                     sid, timeout=2.0)
             res = await self._cdp.cmd(
                 "Runtime.evaluate",
-                {"expression": "window.__olMonitor ? JSON.stringify(window.__olMonitor.drain()) : '[]'",
+                {"expression": "window.__olMonitor ? JSON.stringify(window.__olMonitor.drain()) : ''",
                  "returnByValue": True},
                 sid, timeout=2.0,
             )
             value = ((res or {}).get("result") or {}).get("value")
-            items = json.loads(value) if value else []
-            for item in items:
+            payload = json.loads(value) if value else {}
+            if isinstance(payload, list):
+                # A page still running the previous agent drains a bare list.
+                payload = {"events": payload, "handlers": []}
+            for item in payload.get("events") or []:
                 self._perf_append_event(item)
+            for row in payload.get("handlers") or []:
+                self._perf_merge_handler(row)
         except Exception:
             pass
 
@@ -582,6 +652,51 @@ class PerfMonitor:
         item["rel_ms"] = _number(item.get("rel_ms"))
         item["wall_ms"] = int(item.get("wall_ms") or time.time() * 1000)
         self._perf_event_log.append(item)
+
+    def _perf_merge_handler(self, row):
+        """Fold one drained handler aggregate into the session totals.
+
+        The page keeps the same (handler, event type, site) row for its whole
+        drain window; sums are accumulated here so counts stay correct across
+        drains without keeping an event per call.
+        """
+        if not self._perf_recording or not isinstance(row, dict):
+            return
+        handler = row.get("handler")
+        if not isinstance(handler, dict):
+            handler = {}
+        name = handler.get("name") or "anonymous"
+        site = handler.get("site")
+        site = site if isinstance(site, list) else []
+        key = (row.get("name") or "", name, site[0] if site else "")
+        cur = self._perf_handler_stats.get(key)
+        calls = int(_number(row.get("calls")))
+        if cur is None:
+            cur = self._perf_handler_stats[key] = {
+                "type": row.get("name") or "",
+                "name": name,
+                "site": site,
+                "source": handler.get("source") or "",
+                "target": row.get("target") or "",
+                "calls": 0,
+                "ms": 0.0,
+                "max_ms": 0.0,
+                "scroll_calls": 0,
+                "first_ms": None,
+                "last_ms": None,
+            }
+        cur["calls"] += calls
+        cur["ms"] += _number(row.get("ms"))
+        cur["max_ms"] = max(cur["max_ms"], _number(row.get("max_ms")))
+        cur["scroll_calls"] += int(_number(row.get("scroll_calls")))
+        first = row.get("first_ms")
+        last = row.get("last_ms")
+        if first is not None:
+            first = _number(first)
+            cur["first_ms"] = first if cur["first_ms"] is None else min(cur["first_ms"], first)
+        if last is not None:
+            last = _number(last)
+            cur["last_ms"] = last if cur["last_ms"] is None else max(cur["last_ms"], last)
 
     def _perf_record_event(self, method, sid, params):
         if not self._perf_recording or self._perf_session_start <= 0:
@@ -700,6 +815,7 @@ class PerfMonitor:
         if recording:
             self._perf_event_log.clear()
             self._perf_event_seq = 0
+            self._perf_handler_stats = {}
             self._perf_profile = []
             self._perf_profile_meta = {}
             self._perf_session_elapsed = 0.0
@@ -744,6 +860,7 @@ class PerfMonitor:
 
     async def _perf_clear_events(self):
         self._perf_event_log.clear()
+        self._perf_handler_stats = {}
         self._perf_profile = []
         self._perf_profile_meta = {}
         self._perf_session_start = 0
@@ -754,27 +871,28 @@ class PerfMonitor:
     # ------------------------------------------------------------------
     # AI tools: read what the monitor recorded
     # ------------------------------------------------------------------
-    def _perf_top_handlers(self, events, limit=8):
-        by_name = {}
-        for e in events:
-            handler = e.get("handler") or {}
-            name = handler.get("name") if isinstance(handler, dict) else None
-            if not name or name == "—":
-                continue
-            label = name
-            if name == "anonymous":
+    def _perf_top_handlers(self, limit=8):
+        rows = []
+        for stats in self._perf_handler_stats.values():
+            calls = stats["calls"]
+            name = stats["name"]
+            if name == "anonymous" and stats["site"]:
                 # Unnamed listeners are only distinguishable by where they were
-                # registered, so group them by that site instead of one row.
-                site = handler.get("site") if isinstance(handler, dict) else None
-                if site:
-                    frame = str(site[0] if isinstance(site, list) else site)[:90]
-                    label = f"anonymous @ {frame}"
-            row = by_name.setdefault(label, {"name": label, "calls": 0, "ms": 0.0})
-            row["calls"] += 1
-            row["ms"] += _number(e.get("duration"))
-        rows = sorted(by_name.values(), key=lambda r: (r["ms"], r["calls"]), reverse=True)
-        for row in rows:
-            row["ms"] = round(row["ms"], 1)
+                # registered, so label them by that site.
+                frame = str(stats["site"][0])[:90]
+                name = f"anonymous @ {frame}"
+            rows.append({
+                "name": name,
+                "type": stats["type"],
+                "calls": calls,
+                "ms": round(stats["ms"], 1),
+                "avg_ms": round(stats["ms"] / calls, 3) if calls else 0.0,
+                "max_ms": round(stats["max_ms"], 2),
+                "scroll_calls": stats["scroll_calls"],
+                "first_ms": stats["first_ms"],
+                "last_ms": stats["last_ms"],
+            })
+        rows.sort(key=lambda r: (r["ms"], r["calls"]), reverse=True)
         return rows[:limit]
 
     async def browser_monitor_summary(self):
@@ -806,7 +924,7 @@ class PerfMonitor:
             "event_count": len(events),
             "event_counts": counts,
             "slowest_events": slowest_rows,
-            "top_handlers": self._perf_top_handlers(events),
+            "top_handlers": self._perf_top_handlers(),
             "profile_active": self._perf_profile_active,
             "top_functions": self._perf_profile[:10],
             "profile_noise": self._perf_profile_meta,

@@ -287,17 +287,25 @@
                     <div class="bm-detail-row"><span>target</span><code x-text="selectedEvent?.target || ''"></code></div>
                     <div class="bm-detail-row"><span>handler</span><code x-text="handlerName(selectedEvent)"></code></div>
                     <div class="bm-detail-row"><span>during scroll</span><code x-text="selectedEvent?.during_scroll ? 'yes' : 'no'"></code></div>
+                    <div class="bm-detail-row" x-show="selectedEvent?.data?.entryType === 'long-animation-frame'">
+                        <span>work / render</span>
+                        <code x-text="(selectedEvent?.data?.work_ms || 0) + ' / ' + (selectedEvent?.data?.render_ms || 0) + ' ms'"></code>
+                    </div>
+                    <div class="bm-detail-row" x-show="selectedEvent?.data?.entryType === 'long-animation-frame'">
+                        <span>style + layout</span>
+                        <code x-text="(selectedEvent?.data?.style_layout_ms || 0) + ' ms of render · blocking ' + (selectedEvent?.data?.blocking_ms || 0) + ' ms'"></code>
+                    </div>
                     <div class="bm-detail-section">
                         <span>source</span>
                         <pre class="bm-detail-source" x-text="selectedEvent?.handler?.source || ''"></pre>
                     </div>
                     <div class="bm-detail-section">
                         <span>stack</span>
-                        <pre class="bm-detail-stack" x-text="(selectedEvent?.stack || []).join('\\n')"></pre>
+                        <pre class="bm-detail-stack" x-text="(selectedEvent?.stack || []).join('\n')"></pre>
                     </div>
                     <div class="bm-detail-section" x-show="selectedEvent?.data?.scripts?.length">
                         <span>scripts in this frame</span>
-                        <pre class="bm-detail-stack" x-text="(selectedEvent?.data?.scripts || []).map(s => (s.name || 'anonymous') + ' · ' + (s.duration || 0) + ' ms · ' + (s.url || '')).join(' · ')"></pre>
+                        <pre class="bm-detail-stack" x-text="(selectedEvent?.data?.scripts || []).map(s => (s.name || 'anonymous') + ' · ' + (s.duration || 0) + ' ms' + (s.invokerType ? ' [' + s.invokerType + ']' : '') + (s.forced_ms ? ' · forced ' + s.forced_ms + ' ms' : '') + ' · ' + (s.url || '')).join(' · ')"></pre>
                     </div>
                     <button type="button" class="bm-btn" @click="closeEvent()">Close</button>
                 </aside>
