@@ -46,6 +46,28 @@ class WebuiPerfRoutes(PerfMonitor):
         session_id = (query or {}).get("id")
         return self._perf_recording_for_ui(session_id)
 
+    @webui.route("perf/functions")
+    async def _route_perf_functions(self, body=None, query=None):
+        q = query or {}
+
+        def number(key):
+            try:
+                return float(q.get(key))
+            except (TypeError, ValueError):
+                return None
+
+        recording_id = q.get("id")
+        if recording_id:
+            return self._perf_session_functions(
+                self._perf_load_session(recording_id),
+                min_total_ms=number("min_total_ms") or 0,
+                limit=int(number("limit") or 25),
+                since_ms=number("since_ms"), until_ms=number("until_ms"))
+        return await self.browser_monitor_functions(
+            min_total_ms=number("min_total_ms") or 0,
+            limit=int(number("limit") or 25),
+            since_ms=number("since_ms"), until_ms=number("until_ms"))
+
     @webui.route("perf/recordings/delete", method="POST")
     async def _route_perf_recordings_delete(self, body=None, query=None):
         return self._perf_delete_recording((body or {}).get("id"))

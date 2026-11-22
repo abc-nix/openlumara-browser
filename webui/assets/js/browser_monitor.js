@@ -20,6 +20,7 @@ const BROWSER_MONITOR = {
     eventCount: 0,
     profileFunctions: [],
     profileActive: false,
+    profileWindow: '',
     sessionSecondsValue: 0,
     // Session graph: recording-only samples on a finer grid than the resource
     // history, plus the range the user drags to scope the event list.
@@ -162,7 +163,7 @@ const BROWSER_MONITOR = {
             this.recording = !!r.recording;
             this.sessionSecondsValue = r.session_seconds || 0;
             this.eventCount = r.event_count || 0;
-            this.profileFunctions = r.functions || [];
+            if (!this.profileWindow) this.profileFunctions = r.functions || [];
             this.profileActive = !!r.profile_active;
             this.events = r.events || [];
             this.handlers = r.handlers || [];
@@ -217,6 +218,7 @@ const BROWSER_MONITOR = {
             this.samplesTruncated = 0;
             this.lastSessionId = r.id || this.lastSessionId;
             this.selectedEvent = null;
+            this.profileWindow = '';
             this.clearRange();
         } catch (e) {
             this.error = 'could not open ' + id + ' (' + this.errText(e) + ')';
@@ -237,9 +239,44 @@ const BROWSER_MONITOR = {
     closeReview() {
         this.reviewId = '';
         this.reviewInfoText = '';
+        this.profileWindow = '';
         this.selectedEvent = null;
         this.clearRange();
         this.poll();
+    },
+
+    // ---- profile a slice of the take -----------------------------------
+    // The CPU profile keeps its raw samples with timestamps, so the range the
+    // user dragged over a spike can be attributed on its own: same window for
+    // events and functions.
+    async profileRange() {
+        const sel = this.graphSelection();
+        if (!sel) return;
+        const query = 'since_ms=' + Math.round(sel.from * 1000) +
+                      '&until_ms=' + Math.round(sel.to * 1000) + '&limit=25';
+        const url = this.reviewId
+            ? '/api/ext/browser/perf/functions?id=' + encodeURIComponent(this.reviewId) + '&' + query
+            : '/api/ext/browser/perf/functions?' + query;
+        try {
+            const r = await simpleApiFetch(url);
+            this.profileFunctions = r.functions || [];
+            this.profileWindow = sel.from.toFixed(2) + '–' + sel.to.toFixed(2) + ' s';
+        } catch (e) {
+            this.error = 'could not profile that range (' + this.errText(e) + ')';
+        }
+    },
+
+    async profileWhole() {
+        this.profileWindow = '';
+        const url = this.reviewId
+            ? '/api/ext/browser/perf/functions?id=' + encodeURIComponent(this.reviewId) + '&limit=25'
+            : '/api/ext/browser/perf/functions?limit=25';
+        try {
+            const r = await simpleApiFetch(url);
+            this.profileFunctions = r.functions || [];
+        } catch (e) {
+            this.error = 'could not read the profile (' + this.errText(e) + ')';
+        }
     },
 
     async toggleRecording() {
@@ -291,6 +328,7 @@ const BROWSER_MONITOR = {
             this.handlers = [];
             this.eventCount = 0;
             this.profileFunctions = [];
+            this.profileWindow = '';
             this.profileActive = false;
             this.sessionSecondsValue = 0;
             this.selectedEvent = null;

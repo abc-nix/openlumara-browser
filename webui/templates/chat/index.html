@@ -220,6 +220,8 @@
                     </div>
                     <span class="bm-bar-spacer"></span>
                     <span class="bm-meta" x-text="rangeLabel() || (recIntervalMs + ' ms grid · ' + recSamples.length + ' samples')"></span>
+                    <button type="button" class="bm-btn" x-show="graphSelection()" @click="profileRange()">Profile range</button>
+                    <button type="button" class="bm-btn" x-show="profileWindow" @click="profileWhole()">Whole take</button>
                     <button type="button" class="bm-btn" x-show="graphSelection()" @click="clearRange()">Clear range</button>
                 </div>
                 <div class="bm-graph-plot" @mousemove="hoverGraph($event)" @mouseleave="hoverOut()"
@@ -263,7 +265,7 @@
             <div class="bm-function-panel" x-show="profileFunctions.length">
                 <div class="bm-function-head">
                     <span>Functions · CPU profile</span>
-                    <span x-text="profileFunctions.length + ' functions'"></span>
+                    <span x-text="(profileWindow ? profileWindow + ' · ' : '') + profileFunctions.length + ' functions'"></span>
                 </div>
                 <div class="bm-function-cols">
                     <span>function</span><span>source</span><span>self</span><span>total</span><span>calls</span>

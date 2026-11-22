@@ -8,10 +8,12 @@ rAF callbacks and long tasks. All data stays in memory.
 """
 
 import asyncio
+import base64
 import json
 import os
 import secrets
 import time
+from array import array
 from collections import deque
 
 import core
@@ -482,6 +484,10 @@ class PerfMonitor:
         self._perf_profile_meta = {}
         self._perf_profile_active = False
         self._perf_profile_sid = None
+        self._perf_profile_wall = 0.0        # wall clock at Profiler.start
+        self._perf_profile_graph = None      # {"nodes": …, "parent": …} for windows
+        self._perf_profile_raw = None        # compact samples for windowed rows
+        self._perf_raw_cap = 300000          # ~5 min at the 1 ms sampling interval
         self._perf_doc_agents = {}
         self._perf_stop_task = None      # scheduled auto-stop for AI-started takes
         self._perf_stop_at = 0.0
@@ -522,6 +528,10 @@ class PerfMonitor:
         self._perf_profile_meta = {}
         self._perf_profile_active = False
         self._perf_profile_sid = None
+        self._perf_profile_wall = 0.0        # wall clock at Profiler.start
+        self._perf_profile_graph = None      # {"nodes": …, "parent": …} for windows
+        self._perf_profile_raw = None        # compact samples for windowed rows
+        self._perf_raw_cap = 300000          # ~5 min at the 1 ms sampling interval
         self._perf_doc_agents = {}
         for name in ("_perf_samples", "_perf_last_metrics", "_perf_event_log"):
             bucket = getattr(self, name, None)
@@ -674,6 +684,11 @@ class PerfMonitor:
             await self._cdp.cmd("Profiler.start", {}, sid, timeout=2.0)
             self._perf_profile_active = True
             self._perf_profile_sid = sid
+            # Wall clock at the start lets a session-relative window (the graph's
+            # selection) be mapped onto profile sample offsets later.
+            self._perf_profile_wall = time.time() * 1000
+            self._perf_profile_raw = None
+            self._perf_profile_graph = None
         except Exception:
             self._perf_profile_active = False
             self._perf_profile_sid = None
@@ -695,22 +710,51 @@ class PerfMonitor:
             self._perf_profile_meta = {}
 
     def _perf_profile_parse(self, profile):
+        """Turn a raw V8 profile into rows, and keep the samples for windows.
+
+        The rows answer "what dominated the take". The samples (node id + delta,
+        ~12 bytes each in compact arrays) let a later query answer "what ran
+        between 3.1 and 3.4 s" from the same single profiling run.
+        """
         nodes = {n["id"]: n for n in (profile.get("nodes") or [])
                  if isinstance(n, dict) and n.get("id") is not None}
-        samples = profile.get("samples") or []
-        deltas = profile.get("timeDeltas") or []
-        self_ms = {}
-        counts = {}
-        for i, node_id in enumerate(samples):
-            dt = _number(deltas[i]) if i < len(deltas) else 0
-            self_ms[node_id] = self_ms.get(node_id, 0.0) + max(dt, 0) / 1000.0
-            counts[node_id] = counts.get(node_id, 0) + 1
-
         parent = {}
         for node_id, node in nodes.items():
             for child in node.get("children") or []:
                 parent[child] = node_id
+        samples = profile.get("samples") or []
+        deltas = profile.get("timeDeltas") or []
+        self_ms, counts = self._perf_accumulate(samples, deltas)
+        self._perf_profile_graph = {"nodes": nodes, "parent": parent}
+        self._store_raw_samples(samples, deltas)
+        rows, noise_ms, functions = self._perf_rows_from(nodes, parent, self_ms, counts)
+        self._perf_profile_meta = {
+            "idle_ms": round(noise_ms["(idle)"], 1),
+            "program_ms": round(noise_ms["(program)"], 1),
+            "functions": functions,
+            "returned": len(rows),
+            "samples": len(self._perf_profile_raw["ids"]) if self._perf_profile_raw else 0,
+        }
+        return rows
 
+    @staticmethod
+    def _perf_accumulate(samples, deltas, start_us=0.0, since_us=None, until_us=None):
+        self_ms = {}
+        counts = {}
+        t = start_us
+        for i, node_id in enumerate(samples):
+            dt = max(_number(deltas[i]) if i < len(deltas) else 0.0, 0.0)
+            t += dt
+            if since_us is not None and t < since_us:
+                continue
+            if until_us is not None and t > until_us:
+                continue
+            self_ms[node_id] = self_ms.get(node_id, 0.0) + dt / 1000.0
+            counts[node_id] = counts.get(node_id, 0) + 1
+        return self_ms, counts
+
+    @staticmethod
+    def _perf_rows_from(nodes, parent, self_ms, counts, top=30):
         total = dict(self_ms)
         for node_id, value in list(self_ms.items()):
             cur = node_id
@@ -723,8 +767,8 @@ class PerfMonitor:
         groups = {}
         # V8 names the two frames that are not code under test: `(idle)` is the
         # renderer waiting for work, `(program)` its own runtime. They dominate
-        # by construction, so they are not functions to attribute - counted
-        # here and reported separately as overhead instead of as rows.
+        # by construction, so they are counted and reported as overhead instead
+        # of as rows.
         noise_ms = {"(idle)": 0.0, "(program)": 0.0}
         for node_id, node in nodes.items():
             frame = node.get("callFrame") or {}
@@ -756,17 +800,98 @@ class PerfMonitor:
         rows = [r for r in groups.values() if r["self_ms"] > 0 or r["total_ms"] > 0]
         rows.sort(key=lambda r: (r["total_ms"], r["self_ms"]), reverse=True)
         result = []
-        for row in rows[:30]:
+        for row in rows[:top]:
             row["self_ms"] = round(row["self_ms"], 1)
             row["total_ms"] = round(row["total_ms"], 1)
             result.append(row)
-        self._perf_profile_meta = {
-            "idle_ms": round(noise_ms["(idle)"], 1),
-            "program_ms": round(noise_ms["(program)"], 1),
-            "functions": len(rows),
-            "returned": len(result),
+        return result, noise_ms, len(rows)
+
+    def _perf_profile_raw_payload(self):
+        """Compact, JSON-safe copy of the raw samples for a saved take.
+
+        base64 of the native arrays: ~12 bytes/sample instead of ~12 characters
+        per number in JSON, so a 5 minute take carries a few MB, not tens.
+        """
+        raw = getattr(self, "_perf_profile_raw", None)
+        graph = getattr(self, "_perf_profile_graph", None)
+        if not raw or not graph:
+            return None
+        return {
+            "ids": base64.b64encode(raw["ids"].tobytes()).decode("ascii"),
+            "deltas": base64.b64encode(raw["deltas"].tobytes()).decode("ascii"),
+            "dropped_us": raw["dropped_us"],
+            "wall_ms": int(self._perf_profile_wall or 0),
         }
-        return result
+
+    def _perf_profile_graph_payload(self):
+        """Node names and parent links, JSON-safe (ids as strings/pairs)."""
+        graph = getattr(self, "_perf_profile_graph", None)
+        if not graph:
+            return None
+        nodes = {}
+        for node_id, node in graph.get("nodes", {}).items():
+            frame = node.get("callFrame") or {}
+            nodes[str(node_id)] = {
+                "functionName": frame.get("functionName") or "",
+                "url": frame.get("url") or "",
+                "lineNumber": int(frame.get("lineNumber") or 0),
+            }
+        pairs = [[child, par] for child, par in (graph.get("parent") or {}).items()]
+        return {"nodes": nodes, "parent": pairs}
+
+    def _store_raw_samples(self, samples, deltas):
+        if not samples:
+            self._perf_profile_raw = None
+            return
+        cap = int(getattr(self, "_perf_raw_cap", 300000) or 300000)
+        keep = samples[-cap:]
+        keep_deltas = [max(_number(d), 0.0) for d in deltas[-cap:]]
+        dropped = (sum(max(_number(d), 0.0) for d in deltas[:-cap])
+                   if len(deltas) > cap else 0.0)
+        self._perf_profile_raw = {
+            "ids": array("i", keep),
+            "deltas": array("d", keep_deltas),
+            "dropped_us": dropped,
+        }
+
+    def _perf_profile_rows(self, since_ms=None, until_ms=None):
+        """Rows for the whole take, or only for a session-relative window.
+
+        `since_ms`/`until_ms` use the same clock as events and the graph, so the
+        range the user dragged over a spike is exactly the range queried here.
+        """
+        if since_ms is None and until_ms is None:
+            return self._perf_profile
+        raw = self._perf_profile_raw
+        graph = self._perf_profile_graph
+        if not raw or not graph:
+            return []
+        base = ((self._perf_session_start - self._perf_profile_wall)
+                if self._perf_profile_wall else 0.0)
+        lo = ((since_ms if since_ms is not None else -1e9) + base) * 1000.0
+        hi = ((until_ms if until_ms is not None else 1e12) + base) * 1000.0
+        ids = raw["ids"]
+        deltas = raw["deltas"]
+        self_ms = {}
+        counts = {}
+        taken = 0
+        t = raw["dropped_us"]
+        for i in range(len(ids)):
+            dt = deltas[i]
+            if dt < 0:
+                dt = 0.0
+            t += dt
+            if t < lo or t > hi:
+                continue
+            node_id = ids[i]
+            self_ms[node_id] = self_ms.get(node_id, 0.0) + dt / 1000.0
+            counts[node_id] = counts.get(node_id, 0) + 1
+            taken += 1
+        rows, _noise, total = self._perf_rows_from(graph["nodes"], graph["parent"],
+                                                   self_ms, counts)
+        self._perf_window_samples = taken
+        self._perf_window_functions = total
+        return rows
 
     async def _perf_drain_events(self):
         target = self._perf_selected_target
@@ -1229,6 +1354,8 @@ class PerfMonitor:
             "handlers": self._perf_top_handlers(50),
             "profile": self._perf_profile,
             "profile_meta": self._perf_profile_meta,
+            "profile_raw": self._perf_profile_raw_payload(),
+            "profile_graph": self._perf_profile_graph_payload(),
         }
         meta = {
             "id": rid,
@@ -1414,15 +1541,61 @@ class PerfMonitor:
                 pass
         return {"deleted": name, "ok": removed}
 
-    def _perf_session_functions(self, data, min_total_ms=0, limit=20):
-        profile = data.get("profile") or []
+    def _perf_session_profile_rows(self, data, since_ms=None, until_ms=None):
+        """Rows for a saved take, optionally restricted to a time window."""
+        if since_ms is None and until_ms is None:
+            return data.get("profile") or []
+        raw = data.get("profile_raw")
+        graph = data.get("profile_graph")
+        if not raw or not graph:
+            return []
+        ids = array("i")
+        ids.frombytes(base64.b64decode(raw.get("ids") or ""))
+        deltas = array("d")
+        deltas.frombytes(base64.b64decode(raw.get("deltas") or ""))
+        base = _number(data.get("session_start_ms")) - _number(raw.get("wall_ms"))
+        lo = ((since_ms if since_ms is not None else -1e9) + base) * 1000.0
+        hi = ((until_ms if until_ms is not None else 1e12) + base) * 1000.0
+        t = _number(raw.get("dropped_us"))
+        self_ms = {}
+        counts = {}
+        taken = 0
+        for i in range(len(ids)):
+            dt = deltas[i]
+            if dt < 0:
+                dt = 0.0
+            t += dt
+            if t < lo or t > hi:
+                continue
+            node_id = ids[i]
+            self_ms[node_id] = self_ms.get(node_id, 0.0) + dt / 1000.0
+            counts[node_id] = counts.get(node_id, 0) + 1
+            taken += 1
+        nodes = {int(nid): {"id": int(nid), "callFrame": frame}
+                 for nid, frame in (graph.get("nodes") or {}).items()}
+        parent = {int(child): int(par) for child, par in (graph.get("parent") or [])}
+        rows, _noise, total = self._perf_rows_from(nodes, parent, self_ms, counts)
+        self._perf_window_samples = taken
+        self._perf_window_functions = total
+        return rows
+
+    def _perf_session_functions(self, data, min_total_ms=0, limit=20,
+                                since_ms=None, until_ms=None):
+        windowed = since_ms is not None or until_ms is not None
+        profile = self._perf_session_profile_rows(data, since_ms, until_ms)
         rows = [f for f in profile if _number(f.get("total_ms")) >= _number(min_total_ms)]
         cap = max(min(int(limit or 20), 100), 1)
         return {
             "recording_id": data.get("id"),
             "profile_active": False,
-            "recorded_functions": len(profile),
+            "recorded_functions": (getattr(self, "_perf_window_functions", 0)
+                                   if windowed else
+                                   (data.get("profile_meta") or {}).get(
+                                       "functions", len(data.get("profile") or []))),
             "profile_noise": data.get("profile_meta") or {},
+            "window": ({"since_ms": since_ms, "until_ms": until_ms,
+                        "samples": getattr(self, "_perf_window_samples", 0)}
+                       if windowed else None),
             "functions": rows[:cap],
         }
 
@@ -1691,7 +1864,8 @@ class PerfMonitor:
             "events": rows["events"],
         }, success=True)
 
-    async def browser_monitor_functions(self, min_total_ms: float = 0, limit: int = 20):
+    async def browser_monitor_functions(self, min_total_ms: float = 0, limit: int = 20,
+                                        since_ms: float = None, until_ms: float = None):
         """Read the top functions from the last CPU profile.
 
         The profile is collected while recording and parsed when recording is
@@ -1702,17 +1876,35 @@ class PerfMonitor:
         Args:
             min_total_ms: only functions with at least this total time.
             limit: maximum functions to return.
+            since_ms / until_ms: restrict the profile to a session-relative
+                window (the same clock as events and the graph), e.g. the range
+                dragged over a CPU spike.
         """
-        rows = [f for f in self._perf_profile
+        windowed = since_ms is not None or until_ms is not None
+        source = self._perf_profile_rows(since_ms, until_ms) if windowed else self._perf_profile
+        rows = [f for f in source
                 if _number(f.get("total_ms")) >= _number(min_total_ms)]
         rows = rows[:max(min(int(limit or 20), 100), 1)]
+        note = ""
+        if not rows:
+            note = ("No samples in that window (or none above min_total_ms). "
+                    "Widen it, or record + pause first."
+                    if windowed else
+                    "The CPU profile is parsed on Pause; record + interact + pause first.")
         return self.result({
             "profile_active": self._perf_profile_active,
-            "recorded_functions": len(self._perf_profile),
+            "recorded_functions": (getattr(self, "_perf_window_functions", 0)
+                                   if windowed else
+                                   self._perf_profile_meta.get("functions",
+                                                               len(self._perf_profile))),
             "profile_noise": self._perf_profile_meta,
+            "window": ({"since_ms": since_ms, "until_ms": until_ms,
+                        "samples": getattr(self, "_perf_window_samples", 0),
+                        "buffer_samples": len(self._perf_profile_raw["ids"])
+                                          if self._perf_profile_raw else 0}
+                       if windowed else None),
             "functions": rows,
-            "note": "The CPU profile is parsed on Pause; record + interact + pause first."
-                    if not rows else "",
+            "note": note,
         }, success=True)
 
     async def browser_monitor_resources(self, target_id: str = None, limit: int = 60):
@@ -1785,7 +1977,8 @@ class PerfMonitor:
                                   "returned": rows["returned"], "events": rows["events"]}
             if view in ("all", "functions"):
                 data["functions"] = self._perf_session_functions(
-                    saved, min_total_ms=min_total_ms, limit=limit)
+                    saved, min_total_ms=min_total_ms, limit=limit,
+                    since_ms=since_ms, until_ms=until_ms)
             if view in ("all", "resources"):
                 data["resources"] = self._perf_session_resources(saved, limit=limit)
             return self.result(data, success=True)
@@ -1802,7 +1995,8 @@ class PerfMonitor:
                 include_details=include_details, limit=limit))
         if view in ("all", "functions"):
             data["functions"] = content(await self.browser_monitor_functions(
-                min_total_ms=min_total_ms, limit=limit))
+                min_total_ms=min_total_ms, limit=limit,
+                since_ms=since_ms, until_ms=until_ms))
         if view in ("all", "resources"):
             data["resources"] = content(await self.browser_monitor_resources(
                 target_id=target_id, limit=limit))
