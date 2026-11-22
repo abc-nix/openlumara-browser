@@ -319,7 +319,7 @@ PROBE_JS = r"""
   const now = performance.now();
   if (!window.__olPerf) {
     const s = {frames: 0, gapMax: 0, lastCb: now, long: 0, longTotal: 0,
-               longest: 0, lastRead: now};
+               longest: 0, longestWindow: 0, lastRead: now};
     window.__olPerf = s;
     try {
       new PerformanceObserver((list) => {
@@ -327,6 +327,7 @@ PROBE_JS = r"""
           s.long += 1;
           s.longTotal += 1;
           s.longest = Math.max(s.longest, e.duration || 0);
+          s.longestWindow = Math.max(s.longestWindow, e.duration || 0);
         }
       // 'longtask' misses most jank: a long animation frame is a different
       // entry type, so the per-window count would read 0 while frames run long.
@@ -352,10 +353,12 @@ PROBE_JS = r"""
     long: st.long,
     long_total: st.longTotal,
     longest: Math.round(st.longest),
+    longest_window: Math.round(st.longestWindow),
   };
   st.frames = 0;
   st.gapMax = 0;
   st.long = 0;
+  st.longestWindow = 0;
   st.lastRead = now;
   return JSON.stringify(out);
 })()
@@ -412,7 +415,10 @@ def build_sample(prev, cur, dt, probe=None):
         "frames_lost": int(max(0, round(expected - frames))),
         "long_tasks": int(_number(probe.get("long"))),
         "long_tasks_total": int(_number(probe.get("long_total"))),
+        # longest_task is the page-lifetime maximum, longest_ms is this window's:
+        # a KPI that only ever grows says nothing about the take in front of you.
         "longest_task": int(_number(probe.get("longest"))),
+        "longest_ms": int(_number(probe.get("longest_window"))),
     }
 
 
@@ -462,6 +468,7 @@ class PerfMonitor:
         self._perf_stop_at = 0.0
         self._perf_last_stop = {}
         self._perf_session_tab = {}      # tab id/url/title captured at Record
+        self._perf_net_extra = False     # Network enabled for this take only
         self._perf_stop = asyncio.Event()
         self._perf_task = asyncio.create_task(self._perf_loop())
 
@@ -481,6 +488,7 @@ class PerfMonitor:
         self._perf_cancel_stop()
         self._perf_last_stop = {}
         self._perf_session_tab = {}
+        self._perf_net_extra = False
         self._perf_selected_target = None
         self._perf_recording = False
         self._perf_session_elapsed = 0.0
@@ -560,7 +568,7 @@ class PerfMonitor:
             if acc is None:
                 acc = self._perf_probe_acc[target] = {
                     "window_ms": 0.0, "frames": 0, "gap_max_ms": 0.0,
-                    "long": 0, "long_total": 0, "longest": 0,
+                    "long": 0, "long_total": 0, "longest": 0, "longest_window": 0,
                 }
             acc["window_ms"] += _number(probe.get("window_ms"))
             acc["frames"] += int(_number(probe.get("frames")))
@@ -568,6 +576,7 @@ class PerfMonitor:
             acc["long"] += int(_number(probe.get("long")))
             acc["long_total"] = int(_number(probe.get("long_total")))
             acc["longest"] = max(acc["longest"], _number(probe.get("longest")))
+            acc["longest_window"] = max(acc["longest_window"], _number(probe.get("longest_window")))
         prev = self._perf_last_metrics.get(target)
         if prev is None:
             self._perf_last_metrics[target] = (now, cur)
@@ -580,7 +589,7 @@ class PerfMonitor:
             self._perf_last_metrics[target] = (now, cur)
             if acc is not None:
                 acc.update({"window_ms": 0.0, "frames": 0, "gap_max_ms": 0.0,
-                            "long": 0, "longest": 0})
+                            "long": 0, "longest": 0, "longest_window": 0})
 
     async def _perf_agent_start(self):
         target = self._perf_selected_target
@@ -891,6 +900,28 @@ class PerfMonitor:
             "wall_ms": int(time.time() * 1000),
         })
 
+    async def _perf_network(self, enable):
+        """Turn Network on for the recorded tab while a take is running.
+
+        Network events are what make a recording tell the whole story, but the
+        module keeps Network off for ordinary browsing. This covers only the
+        take and puts it back when the take ends; when the setting is already on
+        for every tab there is nothing to restore.
+        """
+        target = self._perf_selected_target
+        sid = self._attached.get(target) if target else None
+        if not sid or self.config.get("enable_network_monitoring", False):
+            self._perf_net_extra = False
+            return
+        if not enable and not self._perf_net_extra:
+            return
+        try:
+            await self._cdp.cmd("Network.enable" if enable else "Network.disable",
+                                {}, sid, timeout=2.0)
+            self._perf_net_extra = bool(enable)
+        except Exception:
+            self._perf_net_extra = False
+
     async def _perf_capture_tab(self):
         """id/url/title of the tab being recorded, so a saved take says where it came from.
 
@@ -944,6 +975,7 @@ class PerfMonitor:
             await self._perf_profile_stop()
             await self._perf_agent_start()
             await self._perf_profile_start()
+            await self._perf_network(True)
         return {"selected": target_id}
 
     def _perf_session_seconds(self):
@@ -1009,6 +1041,7 @@ class PerfMonitor:
             self._perf_recording = True
             await self._perf_agent_start()
             await self._perf_profile_start()
+            await self._perf_network(True)
         else:
             if self._perf_session_start > 0:
                 self._perf_session_elapsed = max(
@@ -1016,6 +1049,7 @@ class PerfMonitor:
             await self._perf_drain_events()
             self._perf_recording = False
             await self._perf_profile_stop()
+            await self._perf_network(False)
             try:
                 target = self._perf_selected_target
                 sid = self._attached.get(target) if target else None
@@ -1066,6 +1100,7 @@ class PerfMonitor:
     async def _perf_clear_events(self):
         self._perf_cancel_stop()
         self._perf_last_stop = {}
+        await self._perf_network(False)
         self._perf_event_log.clear()
         self._perf_handler_stats = {}
         self._perf_rec_samples.clear()

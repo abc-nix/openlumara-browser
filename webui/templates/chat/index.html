@@ -99,7 +99,7 @@
                         <span class="bm-trend" :class="trendClass('long_tasks')" x-text="trendGlyph('long_tasks')"></span>
                     </div>
                     <span class="bm-kpi-value" x-text="latest() ? latest().long_tasks : '—'"></span>
-                    <span class="bm-kpi-unit" x-text="latest() ? 'longest ' + latest().longest_task + ' ms' : ''"></span>
+                    <span class="bm-kpi-unit" x-text="latest() ? 'longest ' + latest().longest_ms + ' ms' : ''"></span>
                 </div>
                 <div class="bm-kpi" :class="kpiClass('listeners')">
                     <div class="bm-kpi-top">
