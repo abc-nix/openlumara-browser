@@ -35,6 +35,10 @@ const BROWSER_MONITOR = {
     eventCount: 0,
     profileFunctions: [],
     profileActive: false,
+    // How much of the take the raw CPU samples cover: the profiler stream is
+    // ring-buffered, so a long take loses its oldest samples (see
+    // perf.py _perf_profile_coverage).
+    profileCoverage: { samples: 0, covered_s: 0, dropped_s: 0, cap: 0 },
     profileWindow: '',
     sessionSecondsValue: 0,
     // Session graph: recording-only samples on a finer grid than the resource
@@ -189,6 +193,7 @@ const BROWSER_MONITOR = {
             this.eventCount = r.event_count || 0;
             if (!this.profileWindow) this.profileFunctions = r.functions || [];
             this.profileActive = !!r.profile_active;
+            if (r.profile_coverage) this.profileCoverage = r.profile_coverage;
             this.events = r.events || [];
             this.handlers = r.handlers || [];
             this.recSamples = r.samples || [];
@@ -238,6 +243,7 @@ const BROWSER_MONITOR = {
             this.handlers = r.handlers || [];
             this.profileFunctions = r.profile || [];
             this.profileActive = false;
+            this.profileCoverage = r.profile_coverage || this.profileCoverage;
             this.recSamples = r.samples || [];
             this.recIntervalMs = r.sample_interval_ms || 250;
             this.sessionStartMs = r.session_start_ms || 0;
@@ -853,6 +859,17 @@ const BROWSER_MONITOR = {
         const before = Number(this.eventsDroppedBeforeMs) || 0;
         return this.eventsDropped + ' events dropped (log cap)'
             + (before ? ', nothing before ' + (before / 1000).toFixed(1) + ' s' : '');
+    },
+
+    // The raw CPU stream is ring-buffered: say how much of the take it covers,
+    // so a profile that starts mid-session cannot be read as a quiet start.
+    profileCoverageText() {
+        const coverage = this.profileCoverage || {};
+        const covered = Math.round(Number(coverage.covered_s) || 0);
+        const dropped = Math.round(Number(coverage.dropped_s) || 0);
+        if (!covered && !dropped) return '';
+        if (!dropped) return 'profile: ' + covered + ' s';
+        return 'profile: last ' + covered + ' s (' + dropped + ' s lost to the sample cap)';
     },
 
     errText(e) {

@@ -178,6 +178,9 @@
                 <span class="bm-meta"><span x-text="sessionTime()"></span> · <span x-text="eventCount + ' events'"></span></span>
                 <span class="bm-meta" x-show="lastSessionId" :title="'saved to data/browser/recordings'" x-text="'saved: ' + lastSessionId"></span>
                 <span class="bm-meta" x-show="recording && sessionLabel" x-text="'name: ' + sessionLabel"></span>
+                <span class="bm-meta" :class="{ 'bm-dropped': profileCoverage.dropped_s }"
+                      :title="'the CPU profile stream is ring-buffered: this is how much of the take it kept'"
+                      x-show="profileCoverageText()" x-text="profileCoverageText()"></span>
                 <span class="bm-meta bm-dropped" x-show="eventsDropped" :title="'the event log hit its cap; the oldest rows of this take are gone'" x-text="droppedNote()"></span>
                 <span class="bm-bar-spacer"></span>
                 <span class="bm-meta" x-text="'tab: ' + targetLabel()"></span>

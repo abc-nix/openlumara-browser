@@ -493,7 +493,11 @@ class PerfMonitor:
         self._perf_profile_wall = 0.0        # wall clock at Profiler.start
         self._perf_profile_graph = None      # {"nodes": …, "parent": …} for windows
         self._perf_profile_raw = None        # compact samples for windowed rows
-        self._perf_raw_cap = 300000          # ~5 min at the 1 ms sampling interval
+        # ~12 bytes per sample in memory: 600k covers ~10 minutes at the ~1 ms
+        # sampling interval, which is the length of the takes this is used on.
+        # What still falls off is reported (see _perf_profile_coverage), never
+        # silently dropped.
+        self._perf_raw_cap = 600000
         self._perf_doc_agents = {}
         self._perf_stop_task = None      # scheduled auto-stop for AI-started takes
         self._perf_stop_at = 0.0
@@ -537,7 +541,7 @@ class PerfMonitor:
         self._perf_profile_wall = 0.0        # wall clock at Profiler.start
         self._perf_profile_graph = None      # {"nodes": …, "parent": …} for windows
         self._perf_profile_raw = None        # compact samples for windowed rows
-        self._perf_raw_cap = 300000          # ~5 min at the 1 ms sampling interval
+        self._perf_raw_cap = 600000          # ~10 min at the ~1 ms sampling interval
         self._perf_doc_agents = {}
         for name in ("_perf_samples", "_perf_last_metrics", "_perf_event_log"):
             bucket = getattr(self, name, None)
@@ -812,6 +816,25 @@ class PerfMonitor:
             result.append(row)
         return result, noise_ms, len(rows)
 
+    def _perf_profile_coverage(self):
+        """How much of the take the raw CPU samples actually cover.
+
+        The profiler stream is ring-buffered, so a long take loses its oldest
+        samples and the profile silently starts mid-session. Report it instead:
+        `covered_s` is what survived, `dropped_s` what the cap removed, `cap`
+        the sample count it is allowed to keep.
+        """
+        raw = getattr(self, "_perf_profile_raw", None)
+        cap = int(getattr(self, "_perf_raw_cap", 0) or 0)
+        if not raw:
+            return {"samples": 0, "covered_s": 0.0, "dropped_s": 0.0, "cap": cap}
+        return {
+            "samples": len(raw.get("ids") or ()),
+            "covered_s": round((raw.get("covered_us") or 0.0) / 1e6, 1),
+            "dropped_s": round((raw.get("dropped_us") or 0.0) / 1e6, 1),
+            "cap": cap,
+        }
+
     def _perf_profile_raw_payload(self):
         """Compact, JSON-safe copy of the raw samples for a saved take.
 
@@ -849,15 +872,22 @@ class PerfMonitor:
         if not samples:
             self._perf_profile_raw = None
             return
-        cap = int(getattr(self, "_perf_raw_cap", 300000) or 300000)
+        cap = int(getattr(self, "_perf_raw_cap", 600000) or 600000)
         keep = samples[-cap:]
         keep_deltas = [max(_number(d), 0.0) for d in deltas[-cap:]]
-        dropped = (sum(max(_number(d), 0.0) for d in deltas[:-cap])
-                   if len(deltas) > cap else 0.0)
+        # One pass over the whole stream: `dropped_us` is the wall time of the
+        # samples the cap threw away (the start of the take), so coverage is
+        # total minus dropped. Without this a long take's profile silently
+        # starts in the middle, which is exactly what happened to a 430 s take
+        # whose first 103.8 s were missing with nothing in the payload saying so.
+        total = sum(max(_number(d), 0.0) for d in deltas)
+        dropped = total - sum(keep_deltas)
         self._perf_profile_raw = {
             "ids": array("i", keep),
             "deltas": array("d", keep_deltas),
             "dropped_us": dropped,
+            "covered_us": total - dropped,
+            "total_us": total,
         }
 
     def _perf_profile_rows(self, since_ms=None, until_ms=None):
@@ -1296,6 +1326,7 @@ class PerfMonitor:
             "events_dropped_before_ms": round(self._perf_events_dropped_before_ms, 1),
             "functions": self._perf_profile,
             "profile_active": self._perf_profile_active,
+            "profile_coverage": self._perf_profile_coverage(),
             "events": events[-max(int(limit or 300), 1):],
             "handlers": self._perf_top_handlers(20),
             # The recording graph is plotted against session_start_ms, which is
@@ -1376,6 +1407,7 @@ class PerfMonitor:
             "handlers": self._perf_top_handlers(50),
             "profile": self._perf_profile,
             "profile_meta": self._perf_profile_meta,
+            "profile_coverage": self._perf_profile_coverage(),
             "profile_raw": self._perf_profile_raw_payload(),
             "profile_graph": self._perf_profile_graph_payload(),
         }
@@ -1547,6 +1579,7 @@ class PerfMonitor:
             "handlers": data.get("handlers") or [],
             "profile": data.get("profile") or [],
             "profile_meta": data.get("profile_meta") or {},
+            "profile_coverage": data.get("profile_coverage") or {},
         }
 
     def _perf_rename_recording(self, session_id, label):
@@ -1654,6 +1687,7 @@ class PerfMonitor:
                                    (data.get("profile_meta") or {}).get(
                                        "functions", len(data.get("profile") or []))),
             "profile_noise": data.get("profile_meta") or {},
+            "profile_coverage": data.get("profile_coverage") or {},
             "window": ({"since_ms": since_ms, "until_ms": until_ms,
                         "samples": getattr(self, "_perf_window_samples", 0)}
                        if windowed else None),
@@ -1959,6 +1993,7 @@ class PerfMonitor:
                                    self._perf_profile_meta.get("functions",
                                                                len(self._perf_profile))),
             "profile_noise": self._perf_profile_meta,
+            "profile_coverage": self._perf_profile_coverage(),
             "window": ({"since_ms": since_ms, "until_ms": until_ms,
                         "samples": getattr(self, "_perf_window_samples", 0),
                         "buffer_samples": len(self._perf_profile_raw["ids"])
