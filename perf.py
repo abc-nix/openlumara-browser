@@ -1503,6 +1503,9 @@ class PerfMonitor:
             "events_dropped": self._perf_events_dropped,
             "samples": len(samples),
             "long_frames": long_frames,
+            # In the sidecar so `takes` can say whether a take's CPU stream covers
+            # the whole session without opening a multi-megabyte file.
+            "profile_coverage": self._perf_profile_coverage(),
         }
         try:
             folder = self._perf_recordings_dir()
@@ -1787,7 +1790,7 @@ class PerfMonitor:
 
     def _perf_event_rows(self, events, kinds=None, min_duration_ms=0, during_scroll=None,
                          search="", since_ms=None, until_ms=None, include_details=False,
-                         limit=50):
+                         limit=50, head=False):
         wanted = set(kinds or [])
         term = str(search or "").lower()
         rows = []
@@ -1839,7 +1842,9 @@ class PerfMonitor:
         return {
             "matched": len(rows),
             "returned": min(len(rows), cap),
-            "events": rows[-cap:],
+            # `head` serves paging: a window read with a cursor needs the rows
+            # that come first after it, not the newest ones in the slice.
+            "events": rows[:cap] if head else rows[-cap:],
         }
 
     # ------------------------------------------------------------------
@@ -1900,6 +1905,422 @@ class PerfMonitor:
             })
         rows.sort(key=lambda r: (r["ms"], r["calls"]), reverse=True)
         return rows[:limit]
+
+    # ------------------------------------------------------------------
+    # AI read tools: takes / report / slice
+    # ------------------------------------------------------------------
+    # Three tools, one job each:
+    #   takes  - what is on disk, with the flags that say whether a take is
+    #            worth opening at all
+    #   report - one answer for one window: what dominated it, what stalled,
+    #            what it cost. Summarises; never returns rows
+    #   slice  - the rows of one window, filtered and paged, honest about what
+    #            the filters hid
+    # They share _perf_read_source and _perf_window_bounds, so a saved take and
+    # the live session cannot drift apart in shape or clock.
+
+    def _perf_has_live_session(self):
+        return bool(self._perf_event_log) or bool(self._perf_profile) or bool(
+            self._perf_rec_samples.get(self._perf_selected_target))
+
+    def _perf_read_source(self, recording_id=None):
+        """Resolve what a read tool looks at: the live session, or a saved take.
+
+        A live session that has data wins; only when there is none does the
+        newest take on disk get used. That order is deliberate: while a take
+        runs, report() has to describe it, and after Pause it still does until
+        the log is cleared.
+        """
+        if not recording_id and not self._perf_has_live_session():
+            newest = self._perf_list_recordings(1)
+            if newest:
+                recording_id = newest[0].get("id")
+        if recording_id:
+            data = self._perf_load_session(recording_id)
+            return {
+                "saved": True,
+                "id": data.get("id"),
+                "label": data.get("label") or "",
+                "tab": data.get("tab_url") or "",
+                "seconds": _number(data.get("session_seconds")),
+                "session_start_ms": int(_number(data.get("session_start_ms"))),
+                "events": data.get("events") or [],
+                "samples": data.get("samples") or [],
+                "handlers": data.get("handlers") or [],
+                "coverage": data.get("profile_coverage") or {},
+                "data": data,
+            }
+        target = self._perf_selected_target
+        urls = getattr(self, "_target_url", None)
+        return {
+            "saved": False,
+            "id": (self._perf_last_stop or {}).get("id"),
+            "label": self._perf_session_label or "",
+            "tab": urls.get(target, "") if isinstance(urls, dict) else "",
+            "seconds": self._perf_session_seconds(),
+            "session_start_ms": int(self._perf_session_start) if self._perf_session_start > 0 else 0,
+            "events": list(self._perf_event_log),
+            "samples": list(self._perf_rec_samples.get(target, ())),
+            "handlers": self._perf_top_handlers(50),
+            "coverage": self._perf_profile_coverage(),
+            "data": None,
+        }
+
+    def _perf_source_functions(self, source, since_ms=None, until_ms=None):
+        if source["saved"]:
+            return self._perf_session_profile_rows(source["data"], since_ms, until_ms)
+        if since_ms is not None or until_ms is not None:
+            return self._perf_profile_rows(since_ms, until_ms)
+        return list(self._perf_profile)
+
+    @staticmethod
+    def _perf_window_bounds(source, since_ms, until_ms, default_seconds=None):
+        """Session-relative [lo, hi] **in milliseconds**, the whole span by default.
+
+        Milliseconds throughout, because that is the unit events carry in
+        rel_ms and the unit a caller passes in since_ms/until_ms; seconds only
+        appear in the human-facing output. With default_seconds set and no
+        window given, the window is the tail of that length (slice); without it,
+        the whole take (report).
+        """
+        total_ms = (_number(source.get("seconds")) or 0.0) * 1000.0
+        if since_ms is not None:
+            lo = _number(since_ms)
+        elif default_seconds is None:
+            lo = 0.0
+        else:
+            lo = max(0.0, total_ms - _number(default_seconds) * 1000.0)
+        if until_ms is not None:
+            hi = _number(until_ms)
+        elif total_ms:
+            hi = total_ms
+        else:
+            hi = lo + (_number(default_seconds) or 0.0) * 1000.0
+        if hi < lo:
+            lo, hi = hi, lo
+        return lo, hi
+
+    @staticmethod
+    def _perf_sample_rel(source, row):
+        start = source.get("session_start_ms") or 0
+        return (_number(row.get("t")) * 1000 - start) / 1000.0
+
+    def _perf_samples_in_window(self, source, lo, hi):
+        # named so it cannot collide with _perf_window_samples, the int count of
+        # samples a windowed profile read took (set in _perf_profile_rows)
+        # bounds are milliseconds; _perf_sample_rel answers in seconds
+        return [row for row in source["samples"]
+                if lo <= self._perf_sample_rel(source, row) * 1000.0 <= hi]
+
+    @staticmethod
+    def _perf_stats(values):
+        vals = sorted(v for v in values if v is not None)
+        if not vals:
+            return None
+        n = len(vals)
+
+        def at(percent):
+            return vals[min(n - 1, max(0, int(round((percent / 100.0) * (n - 1)))))]
+
+        return {"n": n, "median": round(at(50), 2), "p90": round(at(90), 2),
+                "max": round(vals[-1], 2), "mean": round(sum(vals) / n, 2)}
+
+    @core.module.tool
+    async def monitor_takes(self, limit: int = 5):
+        """List saved takes, newest first, with the flags that say if they are usable.
+
+        Each row carries label, times, tab, session_seconds, event_count,
+        events_dropped (the event log hit its cap), long_frames and
+        profile_coverage (the CPU stream is ring-buffered). A take that says
+        events_dropped > 0 or a dropped_s > 0 is missing part of itself - read
+        it knowing that. `live` describes the session in progress, if any.
+        """
+        cap = max(min(int(limit or 5), 50), 1)
+        rows = self._perf_list_recordings(cap)
+        live = {
+            "recording": self._perf_recording,
+            "label": self._perf_session_label or "",
+            "session_seconds": self._perf_session_seconds(),
+            "event_count": len(self._perf_event_log),
+            "last_session": (self._perf_last_stop or {}).get("id"),
+        }
+        return self.result({"takes": rows, "live": live}, success=True)
+
+    @core.module.tool
+    async def monitor_report(self, recording_id: str = "", since_ms: float = None,
+                             until_ms: float = None, include: list = None, limit: int = 10):
+        """One answer for one window: what dominated, what stalled, what it cost.
+
+        Defaults to the newest take, or to the session still in memory, over the
+        whole span. `since_ms`/`until_ms` are session-relative milliseconds (the
+        same clock as the graph) and narrow it - "the 30 s around the spike" is
+        the case this exists for. `include` selects the blocks: functions,
+        events, samples, long_frames.
+
+        Deliberately returns derived numbers (share of JS per function, medians,
+        recalcs/s) rather than rows: use monitor_slice for the raw rows of the
+        same window.
+        """
+        source = self._perf_read_source(recording_id)
+        windowed = since_ms is not None or until_ms is not None
+        lo, hi = self._perf_window_bounds(source, since_ms, until_ms, default_seconds=None)
+        cap = max(min(int(limit or 10), 50), 1)
+        wanted = {str(x).lower() for x in (include or ["functions", "events", "samples", "long_frames"])}
+
+        events = [e for e in source["events"] if lo <= _number(e.get("rel_ms")) <= hi]
+        counts = {}
+        for event in events:
+            kind = event.get("kind", "?")
+            counts[kind] = counts.get(kind, 0) + 1
+
+        functions = self._perf_source_functions(
+            source, lo if windowed else None, hi if windowed else None)
+        js_ms = sum(_number(row.get("self_ms")) for row in functions)
+        inline_ms = sum(_number(row.get("self_ms")) for row in functions if not row.get("url"))
+
+        out = {
+            "source": {"id": source["id"], "label": source["label"],
+                       "saved": source["saved"], "tab": source["tab"]},
+            "window": {"since_ms": round(lo, 1), "until_ms": round(hi, 1),
+                       "covered_s": round((hi - lo) / 1000.0, 1)},
+            "summary": {
+                "events": len(events),
+                "event_counts": counts,
+                "js_ms": round(js_ms, 1),
+                "inline_ms": round(inline_ms, 1),
+                "profile_coverage": source["coverage"],
+                "note": ("inline_ms is every frame without a source URL: injected "
+                         "scripts (the recorder is one) plus inline page code"),
+            },
+        }
+        if "functions" in wanted:
+            top = []
+            for row in sorted(functions, key=lambda r: -_number(r.get("self_ms")))[:cap]:
+                self_ms = _number(row.get("self_ms"))
+                top.append({
+                    "name": row.get("name"), "url": row.get("url"),
+                    "line": row.get("line"), "self_ms": round(self_ms, 1),
+                    "total_ms": round(_number(row.get("total_ms")), 1),
+                    "share_pct": round(100.0 * self_ms / js_ms, 1) if js_ms else 0.0,
+                })
+            out["functions"] = top
+        if "events" in wanted:
+            worst = sorted(events, key=lambda e: -_number(e.get("duration")))[:cap]
+            out["events"] = {
+                "worst": [{"rel_ms": round(_number(e.get("rel_ms")), 1),
+                           "kind": e.get("kind"), "name": e.get("name"),
+                           "duration_ms": round(_number(e.get("duration")), 1),
+                           "during_scroll": bool(e.get("during_scroll"))} for e in worst],
+                "counts": counts,
+            }
+        if "samples" in wanted:
+            rows = self._perf_samples_in_window(source, lo, hi)
+
+            def series(key):
+                return [_number(r.get(key)) for r in rows]
+
+            nodes = [v for v in series("nodes") if v is not None]
+            out["samples"] = {
+                "n": len(rows),
+                "style_ms": self._perf_stats(series("style_ms")),
+                "layout_ms": self._perf_stats(series("layout_ms")),
+                "fps": self._perf_stats(series("fps")),
+                "script_pct": self._perf_stats(series("script_pct")),
+                "recalcs_per_s": self._perf_stats(series("style_per_s")),
+                "nodes": ({"start": int(nodes[0]), "end": int(nodes[-1]),
+                           "peak": int(max(nodes))} if nodes else None),
+            }
+        if "long_frames" in wanted:
+            frames = [e for e in events if e.get("kind") == "longtask"]
+            totals = {"work_ms": 0.0, "render_ms": 0.0,
+                      "style_layout_ms": 0.0, "blocking_ms": 0.0}
+            for frame in frames:
+                data = frame.get("data") or {}
+                for key in totals:
+                    totals[key] += _number(data.get(key))
+            out["long_frames"] = {
+                "count": len(frames),
+                **{key: round(val, 1) for key, val in totals.items()},
+                "note": ("work_ms excludes render; paint_ms equals duration in this "
+                         "payload and must not be added to it"),
+            }
+        return self.result(out, success=True)
+
+    def _perf_slice_events(self, source, lo, hi, after, cap, kinds=None,
+                           min_duration=0, during_scroll=None, search="",
+                           detail=False, sort="time"):
+        """Filter one window's events and report what the filters kept.
+
+        sort="time" keeps the window ordered and pageable (next_after_ms moves
+        forward); sort="duration" hands back the worst first and cannot page -
+        that is the long_frames case, where the frames are few and the worst is
+        the point.
+        """
+        term = str(search or "").lower()
+        paging = after > lo
+        pool = []
+        for event in source["events"]:
+            rel = _number(event.get("rel_ms"))
+            if rel < lo or rel > hi:
+                continue
+            # a cursor continues strictly after the last row handed out; the
+            # first page must include the row sitting exactly on the boundary
+            if paging and rel <= after:
+                continue
+            if kinds and event.get("kind") not in kinds:
+                continue
+            if _number(event.get("duration")) < _number(min_duration):
+                continue
+            if during_scroll is not None and bool(event.get("during_scroll")) != during_scroll:
+                continue
+            if term:
+                handler = event.get("handler") or {}
+                hay = (f"{event.get('kind', '')} {event.get('name', '')} "
+                       f"{event.get('target', '')} "
+                       f"{handler.get('name', '') if isinstance(handler, dict) else ''}").lower()
+                if term not in hay:
+                    continue
+            pool.append(event)
+        matched = len(pool)
+        if sort == "duration":
+            pool.sort(key=lambda e: -_number(e.get("duration")))
+            pool = pool[:cap]
+            paged = False
+        else:
+            pool.sort(key=lambda e: _number(e.get("rel_ms")))
+            paged = True
+        rows = self._perf_event_rows(pool, include_details=detail,
+                                     limit=max(min(int(cap), 500), 1), head=True)
+        returned = rows["events"]
+        truncated = matched > len(returned)
+        return {
+            "matched": matched,
+            "returned": len(returned),
+            "truncated": truncated,
+            "next_after_ms": (round(_number(returned[-1].get("rel_ms")), 1)
+                              if paged and truncated and returned else None),
+            "rows": returned,
+        }
+
+    @core.module.tool
+    async def monitor_slice(self, recording_id: str = "", since_ms: float = None,
+                            until_ms: float = None, parts: list = None,
+                            kinds: list = None, min_duration_ms: float = 0,
+                            during_scroll: bool = None, search: str = "",
+                            metric: str = "", min_value: float = None,
+                            max_value: float = None, focus: str = "",
+                            detail: bool = False, limit: int = 0,
+                            next_after_ms: float = None):
+        """The rows of one window, filtered and paged, honest about what it hid.
+
+        Window: `since_ms`/`until_ms`, session-relative ms; defaults to the last
+        60 s. `parts` picks samples, events, functions, handlers (default:
+        samples and events).
+
+        Filters - events: `kinds`, `min_duration_ms`, `during_scroll`, `search`.
+        Samples: `metric` (a key the samples carry: style_ms, layout_ms, fps,
+        script_pct, task_pct, nodes, heap, style_per_s...) with `min_value` /
+        `max_value`.
+
+        `focus` is a bounded preset instead of hand-picked filters: long_frames
+        (long frames with their scripts, worst first), spikes (the worst samples
+        by `metric`, default style_ms, plus the events within 500 ms of each),
+        slow_handlers (handler aggregates by time).
+
+        Every part returns matched / returned / truncated and, when it truncated
+        while paging, `next_after_ms` - pass it back to continue.
+        """
+        source = self._perf_read_source(recording_id)
+        focus = str(focus or "").strip().lower()
+        lo, hi = self._perf_window_bounds(source, since_ms, until_ms, default_seconds=60.0)
+        after = _number(next_after_ms) if next_after_ms is not None else lo
+        selected = [str(x).lower() for x in (parts or ["samples", "events"])]
+        sample_keys = sorted({k for row in source["samples"][:5] for k in row if k != "t"})
+
+        out = {"source": {"id": source["id"], "label": source["label"],
+                          "saved": source["saved"], "tab": source["tab"]},
+               "window": {"since_ms": round(lo, 1), "until_ms": round(hi, 1),
+                          "covered_s": round((hi - lo) / 1000.0, 1)},
+               "focus": focus or None, "parts": {}}
+
+        if focus == "long_frames":
+            out["parts"]["events"] = self._perf_slice_events(
+                source, lo, hi, lo, max(min(int(limit or 20), 200), 1),
+                kinds=["longtask"], min_duration=min_duration_ms,
+                during_scroll=during_scroll, search=search, detail=True, sort="duration")
+            return self.result(out, success=True)
+
+        if focus == "slow_handlers":
+            rows = sorted(source["handlers"], key=lambda r: -_number(r.get("ms")))
+            cap = max(min(int(limit or 20), 50), 1)
+            out["parts"]["handlers"] = {"matched": len(rows), "returned": min(cap, len(rows)),
+                                         "truncated": len(rows) > cap, "next_after_ms": None,
+                                         "rows": rows[:cap]}
+            return self.result(out, success=True)
+
+        metric = metric or ("style_ms" if focus == "spikes" else "")
+        if metric and metric not in sample_keys:
+            return self.result({"error": f"unknown metric '{metric}'",
+                                "allowed": sample_keys}, success=False)
+
+        if "samples" in selected or focus == "spikes":
+            cursor = after > lo
+            rows = [row for row in self._perf_samples_in_window(source, lo, hi)
+                    if not cursor
+                    or self._perf_sample_rel(source, row) * 1000.0 > after]
+            if metric:
+                rows = [row for row in rows
+                        if (min_value is None or _number(row.get(metric)) >= _number(min_value))
+                        and (max_value is None or _number(row.get(metric)) <= _number(max_value))]
+            if focus == "spikes":
+                cap = max(min(int(limit or 20), 100), 1)
+                ranked = sorted(rows, key=lambda r: -_number(r.get(metric)))[:cap]
+                marks = [self._perf_sample_rel(source, row) for row in ranked]
+                near = [event for event in source["events"]
+                        if lo <= _number(event.get("rel_ms")) <= hi
+                        and any(abs(_number(event.get("rel_ms")) - mark) <= 500
+                                for mark in marks)]
+                out["parts"]["samples"] = {"matched": len(rows), "returned": len(ranked),
+                                            "truncated": len(rows) > len(ranked),
+                                            "next_after_ms": None, "metric": metric,
+                                            "rows": ranked}
+                out["parts"]["events"] = {
+                    "matched": len(near), "returned": min(len(near), 200),
+                    "truncated": len(near) > 200, "next_after_ms": None,
+                    "rows": self._perf_event_rows(near, limit=200, head=True)["events"]}
+            else:
+                cap = max(min(int(limit or 600), 2000), 1)
+                keep = rows[:cap]
+                out["parts"]["samples"] = {
+                    "matched": len(rows), "returned": len(keep),
+                    "truncated": len(rows) > len(keep),
+                    "next_after_ms": (round(self._perf_sample_rel(source, keep[-1]) * 1000.0, 1)
+                                      if len(rows) > len(keep) and keep else None),
+                    "rows": keep,
+                }
+
+        if "events" in selected:
+            out["parts"]["events"] = self._perf_slice_events(
+                source, lo, hi, after, max(min(int(limit or 200), 500), 1),
+                kinds=kinds, min_duration=min_duration_ms, during_scroll=during_scroll,
+                search=search, detail=detail)
+
+        if "functions" in selected:
+            rows = sorted(self._perf_source_functions(source, lo, hi),
+                          key=lambda r: -_number(r.get("self_ms")))
+            cap = max(min(int(limit or 40), 100), 1)
+            out["parts"]["functions"] = {"matched": len(rows), "returned": min(cap, len(rows)),
+                                          "truncated": len(rows) > cap, "next_after_ms": None,
+                                          "rows": rows[:cap]}
+
+        if "handlers" in selected and "handlers" not in out["parts"]:
+            rows = sorted(source["handlers"], key=lambda r: -_number(r.get("ms")))
+            cap = max(min(int(limit or 20), 50), 1)
+            out["parts"]["handlers"] = {"matched": len(rows), "returned": min(cap, len(rows)),
+                                         "truncated": len(rows) > cap, "next_after_ms": None,
+                                         "rows": rows[:cap]}
+
+        return self.result(out, success=True)
 
     # core registers a tool as '<module>_<method>', so the exposed name of this
     # one is browser_monitor_record: never put the module prefix in the method
@@ -2109,84 +2530,6 @@ class PerfMonitor:
             "latest": samples[-1] if samples else None,
             "samples": samples[-cap:],
         }, success=True)
-
-    @core.module.tool
-    async def monitor(self, view: str = "all", kinds: list = None,
-                      min_duration_ms: float = 0, during_scroll: bool = None,
-                      search: str = "", since_ms: float = None,
-                      until_ms: float = None, include_details: bool = False,
-                      limit: int = 50, min_total_ms: float = 0,
-                      target_id: str = None, recording_id: str = None):
-        """Read the browser monitor's recording and resource data.
-
-        Readings are live by default. Recordings are written to
-        data/browser/recordings/<id>.json every time a recording stops (the UI's
-        Pause or browser_monitor_record); pass `recording_id` to read one from
-        disk later, and view="recordings" to list the saved ones.
-
-        Args:
-            view: all, summary, events, functions, resources, or recordings.
-            kinds: event kinds filter for events.
-            min_duration_ms: minimum event duration for events.
-            during_scroll: only inside/outside scroll windows for events.
-            search: text match over event, target and handler for events.
-            since_ms / until_ms: session-relative window for events.
-            include_details: include handler source/stack and event data.
-            limit: maximum events (or resource samples) to return.
-            min_total_ms: minimum total time for functions.
-            target_id: resource tab; defaults to the monitor's selected tab.
-            recording_id: read a saved recording instead of the live session.
-        """
-        def content(result):
-            return result.get("content", result) if isinstance(result, dict) else result
-
-        view = str(view or "all").lower()
-        if view == "recordings":
-            return self.result({"recordings": self._perf_list_recordings(20)}, success=True)
-        if view not in ("all", "summary", "events", "functions", "resources"):
-            view = "all"
-
-        if recording_id:
-            saved = self._perf_load_session(recording_id)
-            data = {"view": view, "recording_id": saved.get("id"),
-                    "session_seconds": saved.get("session_seconds")}
-            if view in ("all", "summary"):
-                data["summary"] = self._perf_session_summary(saved)
-            if view in ("all", "events"):
-                rows = self._perf_event_rows(
-                    saved.get("events") or [], kinds=kinds,
-                    min_duration_ms=min_duration_ms, during_scroll=during_scroll,
-                    search=search, since_ms=since_ms, until_ms=until_ms,
-                    include_details=include_details, limit=limit)
-                data["events"] = {"matched": rows["matched"],
-                                  "returned": rows["returned"], "events": rows["events"]}
-            if view in ("all", "functions"):
-                data["functions"] = self._perf_session_functions(
-                    saved, min_total_ms=min_total_ms, limit=limit,
-                    since_ms=since_ms, until_ms=until_ms)
-            if view in ("all", "resources"):
-                data["resources"] = self._perf_session_resources(saved, limit=limit)
-            return self.result(data, success=True)
-
-        data = {"view": view, "recording": self._perf_recording,
-                "session_seconds": self._perf_session_seconds(),
-                "last_session_id": (self._perf_last_stop or {}).get("id")}
-        if view in ("all", "summary"):
-            data["summary"] = content(await self._perf_live_summary())
-        if view in ("all", "events"):
-            data["events"] = content(await self._perf_live_events(
-                kinds=kinds, min_duration_ms=min_duration_ms, during_scroll=during_scroll,
-                search=search, since_ms=since_ms, until_ms=until_ms,
-                include_details=include_details, limit=limit))
-        if view in ("all", "functions"):
-            data["functions"] = content(await self._perf_live_functions(
-                min_total_ms=min_total_ms, limit=limit,
-                since_ms=since_ms, until_ms=until_ms))
-        if view in ("all", "resources"):
-            data["resources"] = content(await self._perf_live_resources(
-                target_id=target_id, limit=limit))
-        return self.result(data, success=True)
-
 
 def core_detail_error(exc):
     try:
