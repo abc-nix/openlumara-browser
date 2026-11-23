@@ -4,7 +4,7 @@
    Events. The tab list below them is the browser's real page-tab list; the
    selected row is the tab being sampled/recorded. #}
 <div class="bm-panel" x-data="BROWSER_MONITOR_PANEL" x-init="init()"
-     x-effect="document.body.toggleAttribute('data-bm', sidebarTab === 'browser/browser_monitor')"
+     x-effect="document.body.toggleAttribute('data-bm', $store.ui.sidebarTab === 'browser/browser_monitor')"
      x-cloak>
 
     <div class="bm-head">
