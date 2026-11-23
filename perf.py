@@ -1901,9 +1901,12 @@ class PerfMonitor:
         rows.sort(key=lambda r: (r["ms"], r["calls"]), reverse=True)
         return rows[:limit]
 
+    # core registers a tool as '<module>_<method>', so the exposed name of this
+    # one is browser_monitor_record: never put the module prefix in the method
+    # name itself (that is how 'browser_browser_monitor' happened).
     @core.module.tool
-    async def browser_monitor_record(self, action: str = "start", seconds: int = 15,
-                                     restart: bool = False, label: str = ""):
+    async def monitor_record(self, action: str = "start", seconds: int = 15,
+                             restart: bool = False, label: str = ""):
         """Start, stop or inspect a recording session.
 
         `start` returns immediately and schedules the stop on the server, so the
@@ -1975,13 +1978,13 @@ class PerfMonitor:
 
         return self.result({"error": "action must be start, stop or status"}, success=False)
 
-    async def browser_monitor_summary(self):
+    async def _perf_live_summary(self):
         """Summarize the browser monitor's current state and last recording.
 
         Returns resource snapshot values, event counts by kind, the slowest
         events, top handlers by time, and the top functions from the last CPU
         profile. Use this first to decide what to inspect with
-        browser_monitor_events or browser_monitor_functions.
+        monitor(view="events") or monitor(view="functions").
         """
         events = list(self._perf_event_log)
         counts = {}
@@ -2018,10 +2021,10 @@ class PerfMonitor:
             "resource_samples": len(samples),
         }, success=True)
 
-    async def browser_monitor_events(self, kinds: list = None, min_duration_ms: float = 0,
-                                     during_scroll: bool = None, search: str = "",
-                                     since_ms: float = None, until_ms: float = None,
-                                     include_details: bool = False, limit: int = 50):
+    async def _perf_live_events(self, kinds: list = None, min_duration_ms: float = 0,
+                                during_scroll: bool = None, search: str = "",
+                                since_ms: float = None, until_ms: float = None,
+                                include_details: bool = False, limit: int = 50):
         """Read the recorded event timeline with optional filters.
 
         Args:
@@ -2046,8 +2049,8 @@ class PerfMonitor:
             "events": rows["events"],
         }, success=True)
 
-    async def browser_monitor_functions(self, min_total_ms: float = 0, limit: int = 20,
-                                        since_ms: float = None, until_ms: float = None):
+    async def _perf_live_functions(self, min_total_ms: float = 0, limit: int = 20,
+                                   since_ms: float = None, until_ms: float = None):
         """Read the top functions from the last CPU profile.
 
         The profile is collected while recording and parsed when recording is
@@ -2090,7 +2093,7 @@ class PerfMonitor:
             "note": note,
         }, success=True)
 
-    async def browser_monitor_resources(self, target_id: str = None, limit: int = 60):
+    async def _perf_live_resources(self, target_id: str = None, limit: int = 60):
         """Read recent resource samples for the monitor's selected tab.
 
         Args:
@@ -2108,13 +2111,12 @@ class PerfMonitor:
         }, success=True)
 
     @core.module.tool
-    @core.module.tool
-    async def browser_monitor(self, view: str = "all", kinds: list = None,
-                              min_duration_ms: float = 0, during_scroll: bool = None,
-                              search: str = "", since_ms: float = None,
-                              until_ms: float = None, include_details: bool = False,
-                              limit: int = 50, min_total_ms: float = 0,
-                              target_id: str = None, recording_id: str = None):
+    async def monitor(self, view: str = "all", kinds: list = None,
+                      min_duration_ms: float = 0, during_scroll: bool = None,
+                      search: str = "", since_ms: float = None,
+                      until_ms: float = None, include_details: bool = False,
+                      limit: int = 50, min_total_ms: float = 0,
+                      target_id: str = None, recording_id: str = None):
         """Read the browser monitor's recording and resource data.
 
         Readings are live by default. Recordings are written to
@@ -2170,18 +2172,18 @@ class PerfMonitor:
                 "session_seconds": self._perf_session_seconds(),
                 "last_session_id": (self._perf_last_stop or {}).get("id")}
         if view in ("all", "summary"):
-            data["summary"] = content(await self.browser_monitor_summary())
+            data["summary"] = content(await self._perf_live_summary())
         if view in ("all", "events"):
-            data["events"] = content(await self.browser_monitor_events(
+            data["events"] = content(await self._perf_live_events(
                 kinds=kinds, min_duration_ms=min_duration_ms, during_scroll=during_scroll,
                 search=search, since_ms=since_ms, until_ms=until_ms,
                 include_details=include_details, limit=limit))
         if view in ("all", "functions"):
-            data["functions"] = content(await self.browser_monitor_functions(
+            data["functions"] = content(await self._perf_live_functions(
                 min_total_ms=min_total_ms, limit=limit,
                 since_ms=since_ms, until_ms=until_ms))
         if view in ("all", "resources"):
-            data["resources"] = content(await self.browser_monitor_resources(
+            data["resources"] = content(await self._perf_live_resources(
                 target_id=target_id, limit=limit))
         return self.result(data, success=True)
 

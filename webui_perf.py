@@ -73,7 +73,7 @@ class WebuiPerfRoutes(PerfMonitor):
                 min_total_ms=number("min_total_ms") or 0,
                 limit=int(number("limit") or 25),
                 since_ms=number("since_ms"), until_ms=number("until_ms"))
-        return await self.browser_monitor_functions(
+        return await self._perf_live_functions(
             min_total_ms=number("min_total_ms") or 0,
             limit=int(number("limit") or 25),
             since_ms=number("since_ms"), until_ms=number("until_ms"))
