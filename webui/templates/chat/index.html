@@ -360,6 +360,10 @@
                         <span>folded</span>
                         <code x-text="(selectedEvent?.data?.count || 0) + '× in this window · ' + (selectedEvent?.data?.ms_total || 0) + ' ms total'"></code>
                     </div>
+                    <div class="bm-detail-row" x-show="selectedEvent?.data?.scroll_last != null">
+                        <span>moved</span>
+                        <code x-text="(selectedEvent?.data?.scroll_first ?? 0) + ' → ' + (selectedEvent?.data?.scroll_last ?? 0) + ' px (Δ ' + (selectedEvent?.data?.scroll_delta ?? 0) + ', ' + (selectedEvent?.data?.scroll_min ?? 0) + '..' + (selectedEvent?.data?.scroll_max ?? 0) + ')'"></code>
+                    </div>
                     <div class="bm-detail-row"><span>handler</span><code x-text="handlerName(selectedEvent)"></code></div>
                     <div class="bm-detail-row"><span>during scroll</span><code x-text="selectedEvent?.during_scroll ? 'yes' : 'no'"></code></div>
                     <div class="bm-detail-row" x-show="selectedEvent?.data?.bytes != null">

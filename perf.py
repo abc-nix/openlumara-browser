@@ -167,14 +167,31 @@ AGENT_JS = r"""
     )).observe({entryTypes: ['event']});
   } catch (e) {}
 
+  // One row per window, but each row now says what moved: which element
+  // scrolled (capture sees the inner scroller - window.scrollY is 0 for an app
+  // whose chat scrolls #messages), where it was and how far it went. Without
+  // this a take can only say "a scroll happened", which cannot tell a 5 px
+  // flick from a full-page jump.
   let scrollThrottle = 0;
-  window.addEventListener('scroll', () => {
+  const scrollTopByEl = new WeakMap();
+  window.addEventListener('scroll', (ev) => {
     const now = performance.now();
     if (now - scrollThrottle < 40) return;
     scrollThrottle = now;
     M.scrollAt = now;
-    M.push({kind: 'scroll', name: 'scroll', duration: 0, target: 'document',
-            handler: null, data: {scrollY: window.scrollY, scrollX: window.scrollX},
+    const raw = ev && ev.target;
+    const target = (raw && raw.nodeType === 1) ? raw
+                   : (document.scrollingElement || document.documentElement);
+    const top = Math.round((target && target.scrollTop) || 0);
+    const previous = scrollTopByEl.get(target);
+    scrollTopByEl.set(target, top);
+    M.push({kind: 'scroll', name: 'scroll', duration: 0,
+            target: (target.id || target.tagName || 'document').toLowerCase(),
+            handler: null,
+            data: {scroll_top: top,
+                   scroll_step: previous === undefined ? 0 : top - previous,
+                   scroll_height: Math.round(target.scrollHeight || 0),
+                   client_height: Math.round(target.clientHeight || 0)},
             during_scroll: true});
   }, {passive: true, capture: true});
 
@@ -1006,6 +1023,21 @@ class PerfMonitor:
                 if _number(item.get("duration")) > _number(merged.get("duration")):
                     merged["duration"] = item["duration"]
                     merged["severity"] = item["severity"]
+                # A scroll bucket has to say how far the viewport moved, so the
+                # values accumulate instead of taking the generic rule below:
+                # that keeps the first value of every key, which would freeze
+                # scroll_first at the bucket's first event and make the delta
+                # always zero.
+                if item.get("kind") == "scroll":
+                    incoming = item.get("data") or {}
+                    top = _number(incoming.get("scroll_top"))
+                    data["scroll_last"] = top
+                    data["scroll_min"] = min(_number(data.get("scroll_min")), top)
+                    data["scroll_max"] = max(_number(data.get("scroll_max")), top)
+                    data["scroll_delta"] = top - _number(data.get("scroll_first"))
+                    for extra in ("scroll_height", "client_height"):
+                        if extra in incoming:
+                            data[extra] = incoming[extra]
                 # A request and its response fold into one row: keep the method
                 # from the first and the status from the second.
                 for extra_key, extra_value in (item.get("data") or {}).items():
@@ -1016,6 +1048,13 @@ class PerfMonitor:
                 return
             item["data"]["count"] = 1
             item["data"]["ms_total"] = round(_number(item.get("duration")), 2)
+            if item.get("kind") == "scroll":
+                top = _number(item["data"].get("scroll_top"))
+                item["data"]["scroll_first"] = top
+                item["data"]["scroll_last"] = top
+                item["data"]["scroll_min"] = top
+                item["data"]["scroll_max"] = top
+                item["data"]["scroll_delta"] = 0
             if len(self._perf_merged) > 2000:
                 # Their rows have long left the log; only the map would grow.
                 self._perf_merged.clear()
@@ -1784,6 +1823,13 @@ class PerfMonitor:
                 "handler_name": (e.get("handler") or {}).get("name")
                                 if isinstance(e.get("handler"), dict) else "—",
             }
+            if e.get("kind") == "scroll":
+                # Promoted out of `data`: a reader should not need to know about
+                # include_details to learn that a bucket moved 900 px upward.
+                for key in ("scroll_first", "scroll_last", "scroll_min", "scroll_max",
+                            "scroll_delta", "scroll_height", "client_height"):
+                    if key in data:
+                        row[key] = int(_number(data.get(key)))
             if include_details:
                 row["handler"] = e.get("handler")
                 row["data"] = e.get("data")
